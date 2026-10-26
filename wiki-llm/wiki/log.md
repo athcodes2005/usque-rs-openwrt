@@ -28,9 +28,11 @@ Append new entries at the end.
   - Target-gated Linux-only netlink dependencies (`rtnetlink`, `netlink-packet-route`, `futures`) under `cfg(target_os = "linux")` in `Cargo.toml` and expanded the test suite to 99 unit tests + 4 integration tests.
 - Documented the `router-script` delegation contract in [[overview]] and [[operations/build-and-release]]: any router deployment, binary rollout, or TUN MTU / TCP MSS clamping change must be delegated via a handoff prompt to the agent working in `/Users/atharva/projects/router-script`.
 - Implemented `[I3]` batch outbound UDP transmission (`UdpSendBatch` + Linux `sendmmsg(2)`), sub-millisecond pacing coalescing (`PACING_COALESCE_WINDOW = 500 µs` to prevent Tokio 1 ms timer-wheel stalls), pre-allocated `paced_buf` reuse, and 64-packet non-blocking TUN burst drains (`try_read_tun_packet`) in commit `2323f29` (101 unit tests + 4 integration tests).
+- Fixed musl cross-compilation in `756ec94` (explicit `libc = "0.2"` dependency and `libc::MSG_DONTWAIT as _`) and published `v0.2.1` (`7e8e54a…` archive SHA-256). Live router verification (`measure_load_latency.sh` with `--mtu 1320 --congestion-control bbr2`) measured `+42%` upload throughput (`93.6` $\to$ `133.3 Mbit/s`), `-59%` median upload loaded RTT (`46 ms` $\to$ `19 ms`), and `0 ms` median download bloat (`5 ms` under load = `5 ms` idle).
+- Ingested `audit/2026-10-25-warp-official-vs-usque/` into `wiki-llm/raw/sources/audit/2026-10-25-warp-official-vs-usque/`, synthesized [[bugs/warp-official-audit-2026-10-25]], removed the top-level `audit/` directory, and removed `-C target-cpu=native` from `.cargo/config.toml` so `Swatinem/rust-cache` artifacts remain portable across heterogeneous GitHub Actions runner CPUs.
 
 ## Sources
 
 - `../../src/`, `../../tests/tunnel_mtu.rs`
 - `../../.github/workflows/ci.yml`, `../../.github/workflows/release.yml`
-- `../../audit/2026-10-25-warp-official-vs-usque/HANDOFF.md`
+- `../raw/sources/audit/2026-10-25-warp-official-vs-usque/HANDOFF.md`

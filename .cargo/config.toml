@@ -2,9 +2,5 @@
 # Run clippy instead of plain check on `cargo check`
 # Uncomment the line below to enable this globally:
 # rustc-wrapper = "clippy-driver"
-
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=native"]
-
-[target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=native"]
+# Note: Do not set `-C target-cpu=native` on x86_64/aarch64-unknown-linux-gnu;
+# CI caches compiled artifacts across heterogeneous runner CPU models.

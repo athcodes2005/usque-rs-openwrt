@@ -21,4 +21,4 @@ All architecture, QUIC pacing/congestion-control details, CoDel upload queue man
 - **Overview & CLI Options:** [`wiki-llm/wiki/overview.md`](wiki-llm/wiki/overview.md) · [`wiki-llm/wiki/architecture.md`](wiki-llm/wiki/architecture.md)
 - **QUIC Pacing & Upload CoDel:** [`wiki-llm/wiki/systems/quic-and-pacing.md`](wiki-llm/wiki/systems/quic-and-pacing.md) · [`wiki-llm/wiki/systems/upload-codel.md`](wiki-llm/wiki/systems/upload-codel.md)
 - **Builds & Releases:** [`wiki-llm/wiki/operations/build-and-release.md`](wiki-llm/wiki/operations/build-and-release.md)
-- **Audits & Reverse Engineering:** [`audit/README.md`](audit/README.md) · [`audit/2026-10-25-warp-official-vs-usque/HANDOFF.md`](audit/2026-10-25-warp-official-vs-usque/HANDOFF.md)
+- **Audits & Reverse Engineering:** [`wiki-llm/wiki/bugs/warp-official-audit-2026-10-25.md`](wiki-llm/wiki/bugs/warp-official-audit-2026-10-25.md) · [`wiki-llm/raw/sources/audit/2026-10-25-warp-official-vs-usque/HANDOFF.md`](wiki-llm/raw/sources/audit/2026-10-25-warp-official-vs-usque/HANDOFF.md)

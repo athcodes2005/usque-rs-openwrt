@@ -16,7 +16,7 @@ The repository root is the canonical Rust crate.
 
 - `../raw/sources/upstream-readme.md`: original upstream README from `Diniboy1123/usque-rs`.
 - `../raw/sources/upstream-setup-notes.md`: original upstream OpenWrt IPv6 setup notes.
-- `../../audit/2026-10-25-warp-official-vs-usque/`: comparative reverse-engineering audit of official Cloudflare WARP (`warp-svc` 2026.8.2115.0) vs `usque-rs`.
+- `../raw/sources/audit/2026-10-25-warp-official-vs-usque/`: comparative reverse-engineering audit and disassembly evidence of official Cloudflare WARP (`warp-svc` 2026.8.2115.0) vs `usque-rs`.
 
 ## Sources
 
