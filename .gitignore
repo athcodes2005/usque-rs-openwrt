@@ -22,5 +22,6 @@ target
 
 # own
 .vscode/
+.DS_Store
 config.json
 *.tar.gz
