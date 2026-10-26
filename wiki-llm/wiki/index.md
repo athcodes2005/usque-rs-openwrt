@@ -15,6 +15,7 @@ the Rust module layout and QUIC/MASQUE session lifecycle.
 - [[systems/quic-and-pacing]] — QUIC congestion control (`cubic`, `bbr`, `bbr2`, `reno`), `SendInfo::at` pacing, and keepalives.
 - [[systems/packet-and-icmp]] — IPv4/IPv6 validation, options-aware checksums, and ICMP PMTUD generation.
 - [[systems/upload-codel]] — CoDel queue-delay management on quiche's outgoing datagram FIFO and TUN backpressure.
+- [[systems/udp-receive-buffer]] — `--udp-recv-buffer` (default 4 MiB) on the QUIC UDP socket to stop kernel `RcvbufErrors` under download bursts.
 
 ## Operations
 

@@ -37,6 +37,10 @@ Append new entries at the end.
 - Corrected the wiki: CI clippy has no `--all-features`, and releases trigger only on tags and `workflow_dispatch` (no `release` branch).
 - Removed the `warp-svc`-derived evidence files from the working tree (history not rewritten); see [[bugs/warp-official-audit-2026-10-25]]. Scrubbed local paths, the private LAN IP, and campus/router-model mentions.
 
+## 2026-10-26 — UDP receive buffer (v0.2.2)
+
+- Added `nativetun --udp-recv-buffer <BYTES>` (default 4 MiB, `0` = kernel default), applied per session on Linux via `SO_RCVBUFFORCE` with an `SO_RCVBUF` fallback; effective size logged once per process. Live A/B: `RcvbufErrors` thousands to 0, download ping loss 10–23% to 0–8%. See [[systems/udp-receive-buffer]]. Version bumped to 0.2.2.
+
 ## Sources
 
 - `../../src/`, `../../tests/tunnel_mtu.rs`
