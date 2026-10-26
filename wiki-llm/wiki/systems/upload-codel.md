@@ -2,7 +2,7 @@
 
 ## Problem: unmanaged internal datagram FIFO
 
-`quiche` configures `enable_dgram(true, 1000, 1000)`, which allows up to 1,000 outbound datagrams (~1.3 MB) to queue inside `quiche`'s internal FIFO without timestamps. When the uplink is congested (e.g., 10–18 Mbit/s), bulk TCP uploads fill this FIFO and add 120–250+ ms of standing queueing delay to interactive/gaming packets.
+`quiche` configures `enable_dgram(true, 8192, 1000)` (`DGRAM_RECV_QUEUE_LEN = 8192`, `DGRAM_SEND_QUEUE_LEN = 1000`), which bounds outbound datagrams at 1,000 (~1.3 MB) inside `quiche`'s internal send FIFO without timestamps while giving the receive path an 8,192-datagram buffer against burst loss. When the uplink is congested (e.g., 10–18 Mbit/s), bulk TCP uploads can still fill the 1,000-deep send FIFO and add 120–250+ ms of standing queueing delay to interactive/gaming packets.
 
 Pausing TUN reads (`--tun-backpressure`) only shifts the FIFO into the Linux TUN driver's 500-packet ring buffer rather than engaging `fq_codel`.
 

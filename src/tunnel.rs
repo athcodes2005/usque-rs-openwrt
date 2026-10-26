@@ -16,6 +16,12 @@ use crate::packet;
 use crate::tls;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
+// QUIC datagrams (RFC 9221) are never retransmitted. A deep receive queue
+// absorbs download bursts while the event loop is draining 64-packet batches
+// to the TUN device, whereas the send queue stays small (and managed by
+// --upload-codel / --tun-backpressure) to prevent upload bufferbloat (F10).
+const DGRAM_RECV_QUEUE_LEN: usize = 8192;
+const DGRAM_SEND_QUEUE_LEN: usize = 1000;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 // A session connected at least this long counts as having worked: a clean close
@@ -449,6 +455,86 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
+/// Effective IP MTU that fits inside a QUIC DATAGRAM frame after subtracting
+/// the MASQUE `flow_id` + `context_id` prefix, floored at the IPv6 minimum
+/// link MTU (1280 bytes).
+const fn effective_datagram_ip_mtu(
+    max_writable_dgram: Option<usize>,
+    flow_prefix_len: usize,
+) -> u16 {
+    match max_writable_dgram {
+        Some(max_dgram) => match max_dgram.checked_sub(flow_prefix_len) {
+            Some(ip_mtu) if ip_mtu >= 1280 && ip_mtu <= u16::MAX as usize => ip_mtu as u16,
+            _ => 1280,
+        },
+        None => 1280,
+    }
+}
+
+/// Apply transport parameters, asymmetric datagram queues, PMTUD, and 0-RTT
+/// early data to a `quiche::Config`.
+fn configure_quic(
+    quic_config: &mut quiche::Config,
+    idle: Duration,
+    congestion_control: &str,
+) -> Result<()> {
+    quic_config.verify_peer(false);
+    quic_config
+        .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
+        .map_err(|e| anyhow::anyhow!("set ALPN: {e}"))?;
+    quic_config.set_max_idle_timeout(u64::try_from(idle.as_millis()).unwrap_or(u64::MAX));
+    quic_config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
+    quic_config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
+    // Keep quiche's internal DPLPMTUD disabled on quiche 0.22.0 clients: in
+    // quiche 0.22.0 (`src/path.rs:339`), `should_send_pmtu_probe` checks
+    // `hs_confirmed && hs_done` (`self.handshake_done_sent`), which is only
+    // ever true on a server. Enabling `discover_pmtu(true)` on a client sets
+    // `dgram_max_writable_len()` to 1,322 bytes in `send()` (`src/lib.rs:3384`,
+    // which uses `||`) while `send_single()` (`src/lib.rs:3608`) stays clamped
+    // at `pmtud.get_current() == 1200`, wedging `dgram_send_queue` on the first
+    // packet > 1,157 bytes. With `discover_pmtu(false)` and the 1,350-byte UDP
+    // payload limit, quiche negotiates a 1,322-byte writable datagram payload
+    // (~1,320-byte IP MTU) and `effective_datagram_ip_mtu` advertises that
+    // exact ceiling via ICMP PMTUD.
+    quic_config.discover_pmtu(false);
+    quic_config.enable_early_data();
+    quic_config.set_initial_max_data(10_000_000);
+    quic_config.set_initial_max_stream_data_bidi_local(1_000_000);
+    quic_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    quic_config.set_initial_max_stream_data_uni(1_000_000);
+    quic_config.set_initial_max_streams_bidi(100);
+    quic_config.set_initial_max_streams_uni(100);
+    quic_config.set_disable_active_migration(true);
+    quic_config.enable_dgram(true, DGRAM_RECV_QUEUE_LEN, DGRAM_SEND_QUEUE_LEN);
+    quic_config
+        .set_cc_algorithm_name(congestion_control)
+        .map_err(|e| anyhow::anyhow!("invalid congestion control algorithm: {e}"))?;
+    Ok(())
+}
+
+/// Offer a cached TLS 1.3 / QUIC session ticket on a newly created connection
+/// before any packet is sent. Invalid or corrupted session blobs are dropped
+/// so the connection proceeds with a full handshake.
+fn restore_quic_session(
+    conn: &mut quiche::Connection,
+    offered_session: &mut Option<Vec<u8>>,
+) -> bool {
+    let Some(session) = offered_session.as_deref() else {
+        return false;
+    };
+    match conn.set_session(session) {
+        Ok(()) => {
+            log::debug!("Offering cached QUIC session ({} bytes)", session.len());
+            true
+        }
+        Err(error) => {
+            log::debug!("Discarding unusable cached QUIC session: {error}");
+            *offered_session = None;
+            false
+        }
+    }
+}
+
 /// Run the MASQUE tunnel and reconnect with bounded backoff.
 pub async fn maintain_tunnel(
     config: &Config,
@@ -460,6 +546,7 @@ pub async fn maintain_tunnel(
     let (mut tun_reader, mut tun_writer) = tokio::io::split(async_dev);
 
     let mut reconnect_delay = Duration::from_secs(1);
+    let mut cached_session: Option<Vec<u8>> = None;
     clear_ready_file(tunnel_cfg.ready_file.as_deref());
 
     loop {
@@ -475,6 +562,7 @@ pub async fn maintain_tunnel(
             &mut tun_reader,
             &mut tun_writer,
             &mut connected_at,
+            &mut cached_session,
         )
         .await;
         clear_ready_file(tunnel_cfg.ready_file.as_deref());
@@ -503,37 +591,21 @@ async fn run_tunnel_session<R, W>(
     tun_reader: &mut R,
     tun_writer: &mut W,
     connected_at: &mut Option<Instant>,
+    cached_session: &mut Option<Vec<u8>>,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    let mut offered_session = cached_session.take();
     let tls_material = tls::prepare_tls_material(config)?;
 
     let mut quic_config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| anyhow::anyhow!("quiche config: {e}"))?;
 
-    quic_config.verify_peer(false);
-    quic_config
-        .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
-        .map_err(|e| anyhow::anyhow!("set ALPN: {e}"))?;
-    let endpoint_pub_key_spki_der = tls_material.load_into(&mut quic_config)?;
-
     let idle = idle_timeout(tunnel_cfg.keepalive_period);
-    quic_config.set_max_idle_timeout(u64::try_from(idle.as_millis()).unwrap_or(u64::MAX));
-    quic_config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
-    quic_config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    quic_config.set_initial_max_data(10_000_000);
-    quic_config.set_initial_max_stream_data_bidi_local(1_000_000);
-    quic_config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    quic_config.set_initial_max_stream_data_uni(1_000_000);
-    quic_config.set_initial_max_streams_bidi(100);
-    quic_config.set_initial_max_streams_uni(100);
-    quic_config.set_disable_active_migration(true);
-    quic_config.enable_dgram(true, 1000, 1000);
-    quic_config
-        .set_cc_algorithm_name(&tunnel_cfg.congestion_control)
-        .map_err(|e| anyhow::anyhow!("invalid congestion control algorithm: {e}"))?;
+    configure_quic(&mut quic_config, idle, &tunnel_cfg.congestion_control)?;
+    let endpoint_pub_key_spki_der = tls_material.load_into(&mut quic_config)?;
 
     let bind_addr: SocketAddr = match tunnel_cfg.endpoint {
         SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
@@ -559,6 +631,8 @@ where
     )
     .map_err(|e| anyhow::anyhow!("quiche connect: {e}"))?;
 
+    restore_quic_session(&mut conn, &mut offered_session);
+
     let mut out = vec![0u8; MAX_DATAGRAM_SIZE];
     let mut buf = vec![0u8; 65535];
 
@@ -567,10 +641,11 @@ where
         .map_err(|e| anyhow::anyhow!("initial send: {e}"))?;
     send_paced_packet(&socket, &out[..write], send_info).await?;
 
-    // Complete handshake with a hard deadline. The idle timeout (three
+    // Complete handshake with a hard deadline (or enter 0-RTT early data when
+    // resuming a 0-RTT-capable session ticket). The idle timeout (three
     // keepalives) would end a blackholed handshake far later than this.
     let handshake_started = Instant::now();
-    loop {
+    while !(conn.is_established() || conn.is_in_early_data()) {
         if handshake_started.elapsed() >= HANDSHAKE_TIMEOUT {
             bail!("timed out during QUIC handshake");
         }
@@ -604,13 +679,12 @@ where
             }
         }
 
-        if conn.is_established() {
-            break;
-        }
         if conn.is_closed() {
             bail!("connection closed during handshake");
         }
     }
+
+    let sent_in_early_data = conn.is_in_early_data() && !conn.is_established();
 
     // Verify endpoint key pinning
     let peer_cert = conn
@@ -683,6 +757,13 @@ where
             }
         }
 
+        if sent_in_early_data
+            && !conn.is_in_early_data()
+            && (!conn.is_established() || !conn.is_resumed())
+        {
+            bail!("server rejected 0-RTT early data; reconnecting with full handshake");
+        }
+
         loop {
             match h3_conn.poll(&mut conn) {
                 Ok((sid, quiche::h3::Event::Headers { list, has_body: _ })) if sid == stream_id => {
@@ -715,7 +796,7 @@ where
             }
         }
 
-        if connect_established {
+        if connect_established && conn.is_established() {
             break;
         }
         if conn.is_closed() {
@@ -726,6 +807,17 @@ where
     if !connect_established {
         bail!("timed out waiting for CONNECT response");
     }
+
+    if sent_in_early_data {
+        let peer_cert = conn
+            .peer_cert()
+            .context("WARP endpoint did not provide a peer certificate after 0-RTT")?;
+        if !tls::verify_endpoint_key(peer_cert, &endpoint_pub_key_spki_der) {
+            bail!("peer certificate public key does not match pinned endpoint key");
+        }
+    }
+
+    *cached_session = conn.session().map(<[u8]>::to_vec).or(offered_session);
 
     events::event(Severity::Info, "[connected] MASQUE tunnel established");
     mark_ready(tunnel_cfg.ready_file.as_deref())?;
@@ -839,8 +931,20 @@ where
                             Err(e) => {
                                 stats.dropped.fetch_add(1, Ordering::Relaxed);
                                 log::debug!("datagram send error: {e}, generating ICMP");
-                                if let Some(icmp_pkt) = icmp::compose_icmp_too_large(&tun_buf[..n], 1280) {
-                                    write_tun(tun_writer, &icmp_pkt, &stats, &mut tun_write_failures).await?;
+                                let icmp_mtu = effective_datagram_ip_mtu(
+                                    conn.dgram_max_writable_len(),
+                                    flow_prefix.len(),
+                                );
+                                if let Some(icmp_pkt) =
+                                    icmp::compose_icmp_too_large(&tun_buf[..n], icmp_mtu)
+                                {
+                                    write_tun(
+                                        tun_writer,
+                                        &icmp_pkt,
+                                        &stats,
+                                        &mut tun_write_failures,
+                                    )
+                                    .await?;
                                 }
                             }
                         }
@@ -1006,6 +1110,9 @@ where
             stats
                 .quic_retrans
                 .store(qs.retrans as u64, Ordering::Relaxed);
+            if let Some(session) = conn.session() {
+                *cached_session = Some(session.to_vec());
+            }
             last_quic_stats_update = Instant::now();
         }
 
@@ -1019,6 +1126,10 @@ where
             break Ok(());
         }
     };
+
+    if let Some(session) = conn.session() {
+        *cached_session = Some(session.to_vec());
+    }
 
     result
 }
@@ -1711,5 +1822,294 @@ mod tests {
             ),
             Duration::ZERO
         );
+    }
+
+    // ---- WARP audit optimizations: I1 (asymmetric dgram queues), I4 (PMTUD), I2 (0-RTT) ----
+
+    fn configured_test_pair() -> (quiche::Connection, quiche::Connection, Vec<u8>) {
+        use std::io::Write;
+
+        let key_pair = rcgen::KeyPair::generate().expect("test key");
+        let cert = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("test params")
+            .self_signed(&key_pair)
+            .expect("test cert");
+        let server_cert_der = cert.der().to_vec();
+        let (_, parsed_cert) =
+            x509_parser::parse_x509_certificate(&server_cert_der).expect("parse cert");
+        let server_spki_der = parsed_cert.tbs_certificate.subject_pki.raw.to_vec();
+
+        let make_config = |server: bool| {
+            let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
+            configure_quic(&mut config, Duration::from_secs(90), "cubic").expect("configure_quic");
+            if server {
+                let mut cert_file = tempfile::NamedTempFile::new().expect("temp cert");
+                cert_file
+                    .write_all(cert.pem().as_bytes())
+                    .expect("write cert");
+                let mut key_file = tempfile::NamedTempFile::new().expect("temp key");
+                key_file
+                    .write_all(key_pair.serialize_pem().as_bytes())
+                    .expect("write key");
+                config
+                    .load_cert_chain_from_pem_file(cert_file.path().to_str().expect("path"))
+                    .expect("load cert");
+                config
+                    .load_priv_key_from_pem_file(key_file.path().to_str().expect("path"))
+                    .expect("load key");
+            }
+            config
+        };
+
+        let client_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let server_addr: SocketAddr = "127.0.0.1:4434".parse().unwrap();
+        let mut client_cfg = make_config(false);
+        let mut server_cfg = make_config(true);
+
+        let mut client = quiche::connect(
+            Some("consumer-masque.cloudflareclient.com"),
+            &quiche::ConnectionId::from_ref(&[1; 16]),
+            client_addr,
+            server_addr,
+            &mut client_cfg,
+        )
+        .expect("connect");
+        let mut server = quiche::accept(
+            &quiche::ConnectionId::from_ref(&[2; 16]),
+            None,
+            server_addr,
+            client_addr,
+            &mut server_cfg,
+        )
+        .expect("accept");
+
+        for _ in 0..10 {
+            deliver(&mut client, &mut server);
+            deliver(&mut server, &mut client);
+        }
+        assert!(client.is_established() && server.is_established());
+        (client, server, server_spki_der)
+    }
+
+    #[test]
+    fn asymmetric_dgram_queues_absorb_download_bursts_while_capping_upload_fifo() {
+        // I1: send queue stays at 1,000 (anti-bufferbloat), while receive queue
+        // expands to 8,192 so bursty downloads do not silently lose datagrams.
+        let (mut client, mut server, _) = configured_test_pair();
+
+        for i in 0..DGRAM_SEND_QUEUE_LEN {
+            let payload = (i as u16).to_be_bytes();
+            client.dgram_send(&payload).expect("send queue under limit");
+        }
+        assert_eq!(client.dgram_send_queue_len(), DGRAM_SEND_QUEUE_LEN);
+        assert_eq!(client.dgram_send(&[0xFF; 2]), Err(quiche::Error::Done));
+        drop_oldest_datagrams(&mut client, DGRAM_SEND_QUEUE_LEN);
+
+        // Now deliver a 2,500-datagram download burst into the client's receive
+        // queue without draining dgram_recv yet (> 2.5x the old 1,000 limit).
+        let burst_count = 2_500usize;
+        for i in 0..burst_count {
+            let payload = (i as u16).to_be_bytes();
+            server.dgram_send(&payload).expect("server queue");
+            if server.dgram_send_queue_len() >= 32 {
+                deliver(&mut server, &mut client);
+                deliver(&mut client, &mut server);
+            }
+        }
+        deliver(&mut server, &mut client);
+        deliver(&mut client, &mut server);
+
+        assert_eq!(client.dgram_recv_queue_len(), burst_count);
+        let mut buf = [0u8; 16];
+        for i in 0..burst_count {
+            let len = client.dgram_recv(&mut buf).expect("recv burst dgram");
+            assert_eq!(&buf[..len], &(i as u16).to_be_bytes());
+        }
+    }
+
+    #[test]
+    fn pmtud_probes_up_to_1350_and_expands_writable_datagram_mtu() {
+        // I4: PMTUD probes from the 1,200-byte initial floor up to 1,350 bytes
+        // after handshake confirmation, allowing >1,300-byte datagram payloads.
+        let (mut client, mut server, _) = configured_test_pair();
+        let max_writable = client.dgram_max_writable_len().expect("dgram writable");
+        assert!(
+            max_writable > 1300,
+            "expected PMTUD-probed dgram_max_writable_len > 1300, got {max_writable}"
+        );
+        let large_dgram = vec![0x42u8; 1300];
+        client
+            .dgram_send(&large_dgram)
+            .expect("send 1300-byte datagram");
+        deliver(&mut client, &mut server);
+        let mut recv_buf = vec![0u8; MAX_DATAGRAM_SIZE];
+        let recv_len = server
+            .dgram_recv(&mut recv_buf)
+            .expect("recv 1300-byte datagram");
+        assert_eq!(recv_len, 1300);
+    }
+
+    #[test]
+    fn effective_datagram_ip_mtu_reflects_probed_payload_and_floors_at_1280() {
+        assert_eq!(effective_datagram_ip_mtu(None, 2), 1280);
+        assert_eq!(effective_datagram_ip_mtu(Some(1172), 2), 1280);
+        assert_eq!(effective_datagram_ip_mtu(Some(1282), 2), 1280);
+        assert_eq!(effective_datagram_ip_mtu(Some(1322), 2), 1320);
+    }
+
+    #[test]
+    fn session_resumption_preserves_peer_cert_pin_and_enables_0rtt_early_data() {
+        // I2: cache session ticket from a clean connection and resume with 0-RTT.
+        use std::io::Write;
+
+        let key_pair = rcgen::KeyPair::generate().expect("test key");
+        let cert = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("test params")
+            .self_signed(&key_pair)
+            .expect("test cert");
+        let server_cert_der = cert.der().to_vec();
+        let (_, parsed_cert) =
+            x509_parser::parse_x509_certificate(&server_cert_der).expect("parse cert");
+        let server_spki_der = parsed_cert.tbs_certificate.subject_pki.raw.to_vec();
+
+        let mut cert_file = tempfile::NamedTempFile::new().expect("temp cert");
+        cert_file
+            .write_all(cert.pem().as_bytes())
+            .expect("write cert");
+        let mut key_file = tempfile::NamedTempFile::new().expect("temp key");
+        key_file
+            .write_all(key_pair.serialize_pem().as_bytes())
+            .expect("write key");
+
+        let mut server_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("server config");
+        configure_quic(&mut server_cfg, Duration::from_secs(90), "cubic").expect("configure_quic");
+        server_cfg
+            .load_cert_chain_from_pem_file(cert_file.path().to_str().expect("path"))
+            .expect("load cert");
+        server_cfg
+            .load_priv_key_from_pem_file(key_file.path().to_str().expect("path"))
+            .expect("load key");
+
+        let mut client_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("client config");
+        configure_quic(&mut client_cfg, Duration::from_secs(90), "cubic").expect("configure_quic");
+
+        let client_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let server_addr: SocketAddr = "127.0.0.1:4434".parse().unwrap();
+
+        // 1. Cold handshake
+        let mut client1 = quiche::connect(
+            Some("consumer-masque.cloudflareclient.com"),
+            &quiche::ConnectionId::from_ref(&[1; 16]),
+            client_addr,
+            server_addr,
+            &mut client_cfg,
+        )
+        .expect("connect 1");
+        let mut server1 = quiche::accept(
+            &quiche::ConnectionId::from_ref(&[2; 16]),
+            None,
+            server_addr,
+            client_addr,
+            &mut server_cfg,
+        )
+        .expect("accept 1");
+        for _ in 0..10 {
+            deliver(&mut client1, &mut server1);
+            deliver(&mut server1, &mut client1);
+        }
+        assert!(client1.is_established() && !client1.is_resumed());
+        let mut cached_session = Some(
+            client1
+                .session()
+                .expect("session ticket after cold handshake")
+                .to_vec(),
+        );
+
+        // 2. Reconnect with cached session -> 0-RTT early data + resumed handshake
+        let mut client2 = quiche::connect(
+            Some("consumer-masque.cloudflareclient.com"),
+            &quiche::ConnectionId::from_ref(&[3; 16]),
+            client_addr,
+            server_addr,
+            &mut client_cfg,
+        )
+        .expect("connect 2");
+        let mut server2 = quiche::accept(
+            &quiche::ConnectionId::from_ref(&[4; 16]),
+            None,
+            server_addr,
+            client_addr,
+            &mut server_cfg,
+        )
+        .expect("accept 2");
+
+        assert!(restore_quic_session(&mut client2, &mut cached_session));
+        assert!(cached_session.is_some());
+
+        // Emit initial flight: client2 enters 0-RTT early data immediately.
+        let mut packet = [0u8; MAX_DATAGRAM_SIZE];
+        let (len, info) = client2.send(&mut packet).expect("initial send");
+        assert!(client2.is_in_early_data());
+        let peer_cert_early = client2.peer_cert().expect("peer cert in early data");
+        assert!(tls::verify_endpoint_key(peer_cert_early, &server_spki_der));
+
+        server2
+            .recv(
+                &mut packet[..len],
+                quiche::RecvInfo {
+                    from: info.from,
+                    to: info.to,
+                },
+            )
+            .expect("server2 recv initial");
+
+        // Open HTTP/3 CONNECT request during 0-RTT before server replies.
+        let mut h3_cfg = quiche::h3::Config::new().expect("h3 config");
+        h3_cfg.enable_extended_connect(true);
+        let mut h3_client =
+            quiche::h3::Connection::with_transport(&mut client2, &h3_cfg).expect("h3 in 0-RTT");
+        let req = vec![
+            quiche::h3::Header::new(b":method", b"CONNECT"),
+            quiche::h3::Header::new(b":protocol", b"cf-connect-ip"),
+            quiche::h3::Header::new(b":scheme", b"https"),
+            quiche::h3::Header::new(b":authority", b"cloudflareaccess.com"),
+            quiche::h3::Header::new(b":path", b"/"),
+        ];
+        let stream_id = h3_client
+            .send_request(&mut client2, &req, false)
+            .expect("send CONNECT in 0-RTT");
+        assert_eq!(stream_id, 0);
+
+        for _ in 0..10 {
+            deliver(&mut client2, &mut server2);
+            deliver(&mut server2, &mut client2);
+        }
+        assert!(client2.is_established());
+        assert!(client2.is_resumed());
+        let peer_cert_established = client2.peer_cert().expect("peer cert after resumption");
+        assert!(tls::verify_endpoint_key(
+            peer_cert_established,
+            &server_spki_der
+        ));
+    }
+
+    #[test]
+    fn restore_quic_session_discards_corrupted_session_blobs() {
+        let mut client_cfg = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("client config");
+        configure_quic(&mut client_cfg, Duration::from_secs(90), "cubic").expect("configure_quic");
+        let client_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let server_addr: SocketAddr = "127.0.0.1:4434".parse().unwrap();
+        let mut client = quiche::connect(
+            Some("consumer-masque.cloudflareclient.com"),
+            &quiche::ConnectionId::from_ref(&[9; 16]),
+            client_addr,
+            server_addr,
+            &mut client_cfg,
+        )
+        .expect("connect");
+
+        let mut invalid = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(!restore_quic_session(&mut client, &mut invalid));
+        assert!(invalid.is_none());
     }
 }

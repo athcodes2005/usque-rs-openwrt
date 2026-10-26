@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use tun::AbstractDevice;
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct TunConfig {
     pub name: Option<String>,
     pub mtu: u32,
@@ -33,6 +34,7 @@ pub fn create_tun(cfg: &TunConfig) -> Result<tun::Device> {
     Ok(dev)
 }
 
+#[cfg(target_os = "linux")]
 pub async fn configure_tun(cfg: &TunConfig, dev: &tun::Device) -> Result<()> {
     use futures::stream::TryStreamExt;
 
@@ -94,4 +96,10 @@ pub async fn configure_tun(cfg: &TunConfig, dev: &tun::Device) -> Result<()> {
     log::info!("Link {tun_name} is UP");
 
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unused_async)]
+pub async fn configure_tun(_cfg: &TunConfig, _dev: &tun::Device) -> Result<()> {
+    anyhow::bail!("netlink TUN configuration is only supported on Linux; pass --no-iproute2")
 }

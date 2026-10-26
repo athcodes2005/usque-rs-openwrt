@@ -16,10 +16,10 @@
 ## Session lifecycle
 
 1. Creates the TUN device and connects immediately without waiting for an initial outbound packet.
-2. Enforces bounded 15 s deadlines on both the QUIC handshake and the HTTP/3 `CONNECT-IP` response.
-3. Verifies the server certificate's SubjectPublicKeyInfo against the configured WARP endpoint public key.
+2. Enforces bounded 15 s deadlines on both the QUIC handshake and the HTTP/3 `CONNECT-IP` response, caching the TLS 1.3 / QUIC session ticket (`Connection::session()`) after a verified connection and offering it via `Connection::set_session()` + `Config::enable_early_data()` on reconnects for 0-RTT / 1-RTT session resumption.
+3. Verifies the server certificate's SubjectPublicKeyInfo against the configured WARP endpoint public key on both cold and resumed sessions.
 4. Writes the PID readiness file once `CONNECT-IP` succeeds and removes it when the session ends.
-5. Detects dead paths via a 30 s ACK-eliciting keepalive and 90 s idle timeout, aborts after 32 consecutive TUN write errors, and applies exponential reconnect backoff (1 s to 30 s) for sessions lasting under 10 s.
+5. Configures asymmetric QUIC datagram queues (`8192` receive depth to absorb download bursts without silent RFC 9221 drops, `1000` send depth managed by `--upload-codel` / `--tun-backpressure`), detects dead paths via a 30 s ACK-eliciting keepalive and 90 s idle timeout, aborts after 32 consecutive TUN write errors, and applies exponential reconnect backoff (1 s to 30 s) for sessions lasting under 10 s.
 
 ## Sources
 
