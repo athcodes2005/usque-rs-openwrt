@@ -10,7 +10,7 @@ The repository root is the canonical Rust crate.
 - `src/`: all Rust modules (`main.rs`, `config.rs`, `register.rs`, `tls.rs`, `tun_device.rs`, `tunnel.rs`, `packet.rs`, `icmp.rs`, `events.rs`, `pipeline_tests.rs`).
 - `tests/tunnel_mtu.rs`: Linux TUN integration tests.
 - `.github/workflows/ci.yml`: automated format, Clippy, and unit test workflow.
-- `.github/workflows/release.yml`: multi-architecture static `musl` binary release builder triggered on `v*.*.*` tags or the `release` branch.
+- `.github/workflows/release.yml`: multi-architecture static `musl` binary release builder triggered on `v*.*.*` tags or `workflow_dispatch`, gated by a test job and a tag-vs-`Cargo.toml` version check.
 
 ## Imported raw sources and audits
 

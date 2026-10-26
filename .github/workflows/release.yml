@@ -20,8 +20,53 @@ env:
   CROSS_CONFIG: Cross.toml
 
 jobs:
+  test:
+    name: Test and verify tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml version
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          CARGO_VERSION="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version[[:space:]]*=/{gsub(/[" ]/,"",$0); sub(/^version=/,"",$0); print; exit}' Cargo.toml)"
+          if [[ -z "$CARGO_VERSION" ]]; then
+            echo "::error ::could not read package version from Cargo.toml"
+            exit 1
+          fi
+          if [[ "${RELEASE_TAG#v}" != "$CARGO_VERSION" ]]; then
+            echo "::error ::tag ${RELEASE_TAG} does not match Cargo.toml version ${CARGO_VERSION}"
+            exit 1
+          fi
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build golang-go perl \
+            pkg-config clang libclang-dev nasm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v2-portable
+          shared-key: release-test
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
   build:
     name: Build / ${{ matrix.target }}
+    needs: test
     runs-on: ubuntu-latest
 
     strategy:
@@ -32,7 +77,7 @@ jobs:
           - target: x86_64-unknown-linux-musl
             artifact_name: usque-rs-x86_64-linux-musl
 
-          # ── 64-bit ARM (OpenWrt GL-MT3000 / Filogic / ARM64) ────────────
+          # ── 64-bit ARM (OpenWrt aarch64 routers) ────────────
           - target: aarch64-unknown-linux-musl
             artifact_name: usque-rs-aarch64-linux-musl
 

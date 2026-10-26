@@ -17,8 +17,8 @@ docker run --rm \
 
 ## GitHub Actions CI and Release
 
-- **`.github/workflows/ci.yml`:** runs `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all` on every push and pull request.
-- **`.github/workflows/release.yml`:** runs when pushing a version tag (`v*.*.*`) or via `workflow_dispatch`. It cross-compiles static musl binaries (`aarch64`, `x86_64`, `armv7`, `arm`, `armv5te`, `mipsel`), strips symbols, and publishes both versioned archives and stable asset names (`usque-rs-aarch64-linux-musl.tar.gz`, `usque-rs-aarch64-linux-musl.tar.gz.sha256`) to GitHub Releases so `router-script` can fetch and verify them automatically.
+- **`.github/workflows/ci.yml`:** runs `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings` (no `--all-features`), and `cargo test --all` on pushes to and pull requests against `main`.
+- **`.github/workflows/release.yml`:** runs only when pushing a version tag (`v*.*.*`) or via `workflow_dispatch` (there is no `release` branch trigger). A `test` job runs first and gates every build/publish job via `needs:`: it fails if the tag (minus the leading `v`) differs from the `Cargo.toml` package version, then runs `cargo clippy --all-targets -- -D warnings` and `cargo test --locked`. Asset names and the `.sha256` format are unchanged because `router-script` depends on them. After the gate it cross-compiles static musl binaries (`aarch64`, `x86_64`, `armv7`, `arm`, `armv5te`, `mipsel`), strips symbols, and publishes both versioned archives and stable asset names (`usque-rs-aarch64-linux-musl.tar.gz`, `usque-rs-aarch64-linux-musl.tar.gz.sha256`) to GitHub Releases so `router-script` can fetch and verify them automatically.
 
 ## Handoff to `router-script` for deployment and runtime flags
 
