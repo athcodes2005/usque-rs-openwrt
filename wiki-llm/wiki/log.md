@@ -31,6 +31,12 @@ Append new entries at the end.
 - Fixed musl cross-compilation in `756ec94` (explicit `libc = "0.2"` dependency and `libc::MSG_DONTWAIT as _`) and published `v0.2.1` (`7e8e54a…` archive SHA-256). Live router verification (`measure_load_latency.sh` with `--mtu 1320 --congestion-control bbr2`) measured `+42%` upload throughput (`93.6` $\to$ `133.3 Mbit/s`), `-59%` median upload loaded RTT (`46 ms` $\to$ `19 ms`), and `0 ms` median download bloat (`5 ms` under load = `5 ms` idle).
 - Ingested `audit/2026-10-25-warp-official-vs-usque/` into `wiki-llm/raw/sources/audit/2026-10-25-warp-official-vs-usque/`, synthesized [[bugs/warp-official-audit-2026-10-25]], removed the top-level `audit/` directory, and removed `-C target-cpu=native` from `.cargo/config.toml` so `Swatinem/rust-cache` artifacts remain portable across heterogeneous GitHub Actions runner CPUs.
 
+## 2026-10-26 — Validation fixes (C1, C10, C11, D6, D7)
+
+- `release.yml` now has a `test` job (tag vs `Cargo.toml` version check, `cargo clippy --all-targets -- -D warnings`, `cargo test --locked`) that the build/publish jobs need; asset names unchanged.
+- Corrected the wiki: CI clippy has no `--all-features`, and releases trigger only on tags and `workflow_dispatch` (no `release` branch).
+- Removed the `warp-svc`-derived evidence files from the working tree (history not rewritten); see [[bugs/warp-official-audit-2026-10-25]]. Scrubbed local paths, the private LAN IP, and campus/router-model mentions.
+
 ## Sources
 
 - `../../src/`, `../../tests/tunnel_mtu.rs`
