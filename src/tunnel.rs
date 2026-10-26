@@ -383,12 +383,13 @@ fn send_batch_mmsg(
     }
 
     socket.try_io(tokio::io::Interest::WRITABLE, || {
+        #[allow(clippy::useless_conversion)]
         let sent = unsafe {
             libc::sendmmsg(
                 socket.as_raw_fd(),
                 hdrs.as_mut_ptr(),
                 u32::try_from(count).unwrap_or(u32::MAX),
-                libc::MSG_DONTWAIT,
+                libc::MSG_DONTWAIT as _,
             )
         };
         if sent < 0 {

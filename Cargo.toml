@@ -46,6 +46,7 @@ time = "0.3"
 portable-atomic = { version = "1", features = ["fallback"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 rtnetlink = "0.14"
 netlink-packet-route = "0.21"
 futures = "0.3"
