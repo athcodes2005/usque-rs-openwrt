@@ -244,8 +244,12 @@ fn drop_oldest_datagrams(conn: &mut quiche::Connection, count: usize) {
 
 /// Drop the upload datagrams that have waited too long, before quiche sends
 /// again, and now and then report how many went.
-fn drop_stale_uploads(queue: &mut UploadQueue, conn: &mut quiche::Connection, stats: &Stats) {
-    let now = Instant::now();
+fn drop_stale_uploads_at(
+    now: Instant,
+    queue: &mut UploadQueue,
+    conn: &mut quiche::Connection,
+    stats: &Stats,
+) {
     let stale = queue.stale(now, conn.dgram_send_queue_len());
     if stale > 0 {
         drop_oldest_datagrams(conn, stale);
@@ -254,6 +258,10 @@ fn drop_stale_uploads(queue: &mut UploadQueue, conn: &mut quiche::Connection, st
     if let Some(report) = queue.report(now) {
         events::event(Severity::Info, &report);
     }
+}
+
+fn drop_stale_uploads(queue: &mut UploadQueue, conn: &mut quiche::Connection, stats: &Stats) {
+    drop_stale_uploads_at(Instant::now(), queue, conn, stats);
 }
 
 fn idle_timeout(keepalive: Duration) -> Duration {
@@ -1652,20 +1660,23 @@ mod tests {
     #[test]
     fn stale_uploads_leave_quiche_and_count_as_dropped() {
         let (mut client, mut server) = connected_pair();
-        let queued_at = Instant::now()
-            .checked_sub(ms(500))
-            .expect("test instant should allow a 500 ms subtraction");
+        let queued_at = Instant::now();
+        let first_check = queued_at + ms(500);
         let mut queue = UploadQueue::new(TARGET, DATAGRAM, queued_at);
         for id in 0..10u8 {
             client.dgram_send(&[id; 200]).expect("queue");
             queue.push(queued_at, 200);
         }
         let stats = Stats::new();
-        drop_stale_uploads(&mut queue, &mut client, &stats);
+        drop_stale_uploads_at(first_check, &mut queue, &mut client, &stats);
         assert_eq!(stats.dropped.load(Ordering::Relaxed), 0);
         // Still above target an interval later: the oldest goes.
-        std::thread::sleep(CODEL_INTERVAL);
-        drop_stale_uploads(&mut queue, &mut client, &stats);
+        drop_stale_uploads_at(
+            first_check + CODEL_INTERVAL,
+            &mut queue,
+            &mut client,
+            &stats,
+        );
         assert_eq!(stats.dropped.load(Ordering::Relaxed), 1);
         assert_eq!(client.dgram_send_queue_len(), 9);
         deliver(&mut client, &mut server);
