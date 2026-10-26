@@ -116,6 +116,5 @@ jobs:
             ${{ steps.pkg.outputs.archive }}.sha256
             ${{ steps.pkg.outputs.stable_archive }}
             ${{ steps.pkg.outputs.stable_archive }}.sha256
-            usque-rs-aarch64-linux-musl*
           generate_release_notes: true
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
