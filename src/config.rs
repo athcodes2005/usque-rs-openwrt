@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
+use tempfile::NamedTempFile;
 
 use crate::register::AccountData;
 
@@ -28,16 +30,48 @@ impl Config {
 
     pub fn save(&self, path: &str) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        if let Some(parent) = Path::new(path).parent() {
+        let target = Path::new(path);
+        if let Some(parent) = target.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
         }
-        fs::write(path, json).with_context(|| format!("failed to write config to {path}"))
+
+        let parent = target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut temp = NamedTempFile::new_in(parent)
+            .with_context(|| format!("failed to create temporary config beside {path}"))?;
+        temp.write_all(json.as_bytes())?;
+        temp.flush()?;
+        temp.as_file().sync_all()?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            temp.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("failed to secure config permissions for {path}"))?;
+        }
+
+        temp.persist(target)
+            .map_err(|error| error.error)
+            .with_context(|| format!("failed to atomically replace config at {path}"))?;
+
+        Ok(())
     }
 
-    pub fn from_account_data(account: &AccountData, token: &str, priv_key_der: &[u8]) -> Self {
-        let peer = &account.config.peers[0];
+    pub fn from_account_data(
+        account: &AccountData,
+        token: &str,
+        priv_key_der: &[u8],
+    ) -> Result<Self> {
+        let peer = account
+            .config
+            .peers
+            .first()
+            .context("registration response did not contain a WARP peer")?;
         let ep_v4 = peer.endpoint.v4.trim_end_matches(":0").to_string();
         let ep_v6 = peer.endpoint.v6.clone();
         let ep_v6 = ep_v6
@@ -46,7 +80,7 @@ impl Config {
             .trim_end_matches(":0")
             .to_string();
 
-        Self {
+        Ok(Self {
             private_key: base64::engine::general_purpose::STANDARD.encode(priv_key_der),
             endpoint_v4: ep_v4,
             endpoint_v6: ep_v6,
@@ -56,7 +90,7 @@ impl Config {
             access_token: token.to_string(),
             ipv4: account.config.interface.addresses.v4.clone(),
             ipv6: account.config.interface.addresses.v6.clone(),
-        }
+        })
     }
 
     pub fn get_ec_private_key_der(&self) -> Result<Vec<u8>> {

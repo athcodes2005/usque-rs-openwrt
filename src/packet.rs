@@ -11,6 +11,11 @@ pub enum PacketError {
     UnknownVersion(u8),
     #[error("packet too short for IPv{version} header (got {len} bytes)")]
     TooShort { version: u8, len: usize },
+    #[error("invalid IPv4 header length: {header_len} bytes for a {packet_len}-byte packet")]
+    InvalidIpv4HeaderLength {
+        header_len: usize,
+        packet_len: usize,
+    },
     #[error("TTL/hop limit too small: {0}")]
     TtlExpired(u8),
 }
@@ -35,12 +40,19 @@ pub fn prepare_outgoing(buf: &mut [u8]) -> Result<u8, PacketError> {
                     len: buf.len(),
                 });
             }
+            let header_len = usize::from(buf[0] & 0x0F) * 4;
+            if header_len < IPV4_HEADER_LEN || header_len > buf.len() {
+                return Err(PacketError::InvalidIpv4HeaderLength {
+                    header_len,
+                    packet_len: buf.len(),
+                });
+            }
             let ttl = buf[8];
             if ttl <= 1 {
                 return Err(PacketError::TtlExpired(ttl));
             }
             buf[8] -= 1;
-            let checksum = calculate_ipv4_checksum(&buf[..IPV4_HEADER_LEN]);
+            let checksum = calculate_ipv4_checksum(&buf[..header_len]);
             buf[10..12].copy_from_slice(&checksum.to_be_bytes());
             Ok(4)
         }
@@ -73,6 +85,13 @@ pub fn validate_incoming(buf: &[u8]) -> Result<u8, PacketError> {
                 return Err(PacketError::TooShort {
                     version: 4,
                     len: buf.len(),
+                });
+            }
+            let header_len = usize::from(buf[0] & 0x0F) * 4;
+            if header_len < IPV4_HEADER_LEN || header_len > buf.len() {
+                return Err(PacketError::InvalidIpv4HeaderLength {
+                    header_len,
+                    packet_len: buf.len(),
                 });
             }
             Ok(4)
@@ -213,6 +232,42 @@ mod tests {
                 version: 4,
                 len: 10
             })
+        ));
+    }
+
+    #[test]
+    fn test_ipv4_options_checksum_uses_full_header() {
+        let mut pkt = vec![0u8; 28];
+        pkt[0] = 0x47; // IPv4, IHL = 7 (28 bytes)
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[20..28].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        assert_eq!(prepare_outgoing(&mut pkt).unwrap(), 4);
+        let mut sum: u32 = (0..28)
+            .step_by(2)
+            .map(|i| u32::from(u16::from_be_bytes([pkt[i], pkt[i + 1]])))
+            .sum();
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        assert_eq!(sum as u16, 0xFFFF);
+    }
+
+    #[test]
+    fn test_invalid_ipv4_header_lengths() {
+        let mut too_small = vec![0u8; 20];
+        too_small[0] = 0x44;
+        assert!(matches!(
+            prepare_outgoing(&mut too_small),
+            Err(PacketError::InvalidIpv4HeaderLength { .. })
+        ));
+
+        let mut beyond_packet = vec![0u8; 20];
+        beyond_packet[0] = 0x46;
+        assert!(matches!(
+            validate_incoming(&beyond_packet),
+            Err(PacketError::InvalidIpv4HeaderLength { .. })
         ));
     }
 

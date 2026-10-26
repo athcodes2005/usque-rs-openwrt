@@ -26,6 +26,7 @@
 //! usque-rs - MASQUE (CONNECT-IP) client for Cloudflare WARP.
 
 mod config;
+mod events;
 mod icmp;
 mod packet;
 mod register;
@@ -33,8 +34,13 @@ mod tls;
 mod tun_device;
 mod tunnel;
 
+#[cfg(test)]
+mod pipeline_tests;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use events::Severity;
+use std::path::Path;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -82,10 +88,32 @@ enum Commands {
         keepalive_period: u64,
         #[arg(short, long, default_value_t = 1280)]
         mtu: u32,
+        /// QUIC congestion control algorithm
+        #[arg(
+            long,
+            default_value = "cubic",
+            value_parser = ["cubic", "bbr", "bbr2", "reno"]
+        )]
+        congestion_control: String,
         #[arg(short = 'I', long, default_value_t = false)]
         no_iproute2: bool,
         #[arg(short = 'n', long)]
         interface_name: Option<String>,
+        /// Write this marker after CONNECT-IP is ready; remove it on disconnect
+        #[arg(long)]
+        ready_file: Option<String>,
+        /// Pause reading the TUN device while this many datagrams wait to be
+        /// sent, so the excess queues in the kernel instead (0 disables)
+        #[arg(long, default_value_t = 0)]
+        tun_backpressure: usize,
+        /// Drop upload datagrams, CoDel-style, while they wait longer than
+        /// this many milliseconds to be sent (0 disables)
+        #[arg(long, value_name = "MS", default_value_t = 0)]
+        upload_codel: u64,
+        /// Also send connection events (connecting, connected, why a session
+        /// ended, fatal errors) to the system log
+        #[arg(long, default_value_t = false)]
+        syslog: bool,
     },
 }
 
@@ -110,10 +138,23 @@ async fn main() -> Result<()> {
             sni_address,
             keepalive_period,
             mtu,
+            congestion_control,
             no_iproute2,
             interface_name,
+            ready_file,
+            tun_backpressure,
+            upload_codel,
+            syslog,
         } => {
-            cmd_nativetun(
+            if syslog {
+                match events::Syslog::new(Path::new(events::SYSLOG_SOCKET)) {
+                    Ok(syslog) => events::enable_syslog(syslog),
+                    Err(error) => {
+                        events::event(Severity::Warning, &format!("syslog unavailable: {error}"));
+                    }
+                }
+            }
+            let result = cmd_nativetun(
                 &cli.config,
                 connect_port,
                 ipv6,
@@ -122,10 +163,19 @@ async fn main() -> Result<()> {
                 &sni_address,
                 Duration::from_secs(keepalive_period),
                 mtu,
+                &congestion_control,
                 no_iproute2,
                 interface_name,
+                ready_file,
+                tun_backpressure,
+                Duration::from_millis(upload_codel),
             )
-            .await
+            .await;
+            // main reports the error on stderr itself; syslog needs a copy.
+            if let Err(error) = &result {
+                events::syslog(Severity::Warning, &format!("[fatal] {error:#}"));
+            }
+            result
         }
     }
 }
@@ -169,7 +219,7 @@ async fn cmd_register(
     let (priv_key_der, pub_key_der) = register::generate_ec_keypair()?;
     let updated = register::enroll_key(&account_data, &pub_key_der, device_name.as_deref()).await?;
 
-    let cfg = config::Config::from_account_data(&updated, &account_data.token, &priv_key_der);
+    let cfg = config::Config::from_account_data(&updated, &account_data.token, &priv_key_der)?;
     cfg.save(config_path)?;
     log::info!("Config saved to {config_path}");
     Ok(())
@@ -185,11 +235,18 @@ async fn cmd_nativetun(
     sni: &str,
     keepalive_period: Duration,
     mtu: u32,
+    congestion_control: &str,
     no_iproute2: bool,
     interface_name: Option<String>,
+    ready_file: Option<String>,
+    tun_backpressure: usize,
+    upload_codel: Duration,
 ) -> Result<()> {
+    if keepalive_period.is_zero() {
+        anyhow::bail!("keepalive period must be at least one second");
+    }
     let cfg = config::Config::load(config_path)?;
-    eprintln!("Config loaded from {config_path}");
+    events::event(Severity::Info, &format!("Config loaded from {config_path}"));
 
     let endpoint_ip: std::net::IpAddr = if use_ipv6 {
         cfg.endpoint_v6.parse()?
@@ -216,7 +273,7 @@ async fn cmd_nativetun(
     let tun_dev = tun_device::create_tun(&tun_cfg)?;
 
     if no_iproute2 {
-        eprintln!("Skipping address setup (--no-iproute2)");
+        events::event(Severity::Info, "Skipping address setup (--no-iproute2)");
     } else {
         tun_device::configure_tun(&tun_cfg, &tun_dev).await?;
     }
@@ -226,7 +283,42 @@ async fn cmd_nativetun(
         sni: sni.to_string(),
         keepalive_period,
         mtu,
+        congestion_control: congestion_control.to_string(),
+        ready_file,
+        tun_backpressure,
+        upload_codel,
     };
 
     tunnel::maintain_tunnel(&cfg, &tunnel_cfg, tun_dev).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn nativetun_lists_the_upload_codel_for_tunnel_sh() {
+        // tunnel.sh passes --upload-codel only to a binary whose help lists it.
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("nativetun")
+            .expect("nativetun subcommand")
+            .render_help()
+            .to_string();
+        assert!(help.contains("--upload-codel <MS>"), "{help}");
+    }
+
+    #[test]
+    fn the_upload_codel_is_off_unless_asked_for() {
+        let target = |args: &[&str]| match Cli::parse_from(args.iter().copied()).command {
+            Commands::NativeTun { upload_codel, .. } => upload_codel,
+            Commands::Register { .. } => unreachable!("parsed nativetun"),
+        };
+        assert_eq!(target(&["usque-rs", "nativetun"]), 0);
+        assert_eq!(
+            target(&["usque-rs", "nativetun", "--upload-codel", "20"]),
+            20
+        );
+    }
 }
