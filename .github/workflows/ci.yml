@@ -63,8 +63,24 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Check Clippy errors
+        run: |
+          cargo clippy --all-targets --all-features --message-format=short -- -D warnings || {
+            cargo clippy --all-targets --all-features --message-format=json -- -D warnings | python3 -c '
+          import json, sys
+          for line in sys.stdin:
+              try:
+                  d = json.loads(line)
+                  msg = d.get("message", {})
+                  if msg.get("level") in ("error", "warning"):
+                      spans = msg.get("spans", [{}])
+                      s = spans[0] if spans else {}
+                      print(f"::error file={s.get(\"file_name\",\"src/main.rs\")},line={s.get(\"line_start\",1)}::{msg.get(\"rendered\", msg.get(\"message\",\"\")).splitlines()[0]}")
+              except Exception:
+                  pass
+          '
+            exit 1
+          }
 
   test:
     name: Test
