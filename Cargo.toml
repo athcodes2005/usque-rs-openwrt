@@ -1,6 +1,6 @@
 [package]
 name = "usque-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "OpenWrt-optimized Rust MASQUE (CONNECT-IP over HTTP/3 & QUIC) client for Cloudflare WARP"
 repository = "https://github.com/athcodes2005/usque-rs-openwrt"
