@@ -26,6 +26,7 @@ Append new entries at the end.
   - **`[I2]` QUIC 0-RTT & TLS 1.3 session resumption (`src/tunnel.rs`):** enabled `Config::enable_early_data()`, cached `Connection::session()` tickets across reconnects after peer SPKI verification and `CONNECT-IP` readiness, and offered them via `Connection::set_session()` so HTTP/3 `CONNECT-IP` requests can be sent in 0-RTT early data with automatic fallback to a full handshake on rejection or expiry.
   - **`[I4]` Dynamic writable datagram IP MTU & `quiche` 0.22.0 client DPLPMTUD guard (`src/tunnel.rs`):** added `effective_datagram_ip_mtu(conn.dgram_max_writable_len(), flow_prefix.len())` so ICMP Packet Too Big / Fragmentation Needed responses advertise the negotiated ~1,320 B datagram IP payload ceiling instead of a hardcoded 1,280 B. Explicitly kept `Config::discover_pmtu(false)` on the client after uncovering an upstream `quiche` 0.22.0 bug (`src/path.rs:339` checks `hs_confirmed && hs_done` where `handshake_done_sent` is server-only, which wedges `dgram_send_queue` on clients for packets > 1,157 B).
   - Target-gated Linux-only netlink dependencies (`rtnetlink`, `netlink-packet-route`, `futures`) under `cfg(target_os = "linux")` in `Cargo.toml` and expanded the test suite to 99 unit tests + 4 integration tests.
+- Documented the `router-script` delegation contract in [[overview]] and [[operations/build-and-release]]: any router deployment, binary rollout, or TUN MTU / TCP MSS clamping change must be delegated via a handoff prompt to the agent working in `/Users/atharva/projects/router-script`.
 
 ## Sources
 

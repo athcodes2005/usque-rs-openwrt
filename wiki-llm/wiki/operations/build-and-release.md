@@ -18,7 +18,11 @@ docker run --rm \
 ## GitHub Actions CI and Release
 
 - **`.github/workflows/ci.yml`:** runs `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all` on every push and pull request.
-- **`.github/workflows/release.yml`:** runs when pushing a version tag (`v*.*.*`) or pushing to the `release` branch. It cross-compiles static musl binaries (`aarch64`, `x86_64`, `armv7`, `arm`, `armv5te`, `mipsel`), strips symbols, and publishes both versioned archives and stable asset names (`usque-rs-aarch64-linux-musl`, `usque-rs-aarch64-linux-musl.sha256`, `usque-rs-aarch64-linux-musl.tar.gz`) to GitHub Releases so `router-script` can fetch and verify them automatically.
+- **`.github/workflows/release.yml`:** runs when pushing a version tag (`v*.*.*`) or via `workflow_dispatch`. It cross-compiles static musl binaries (`aarch64`, `x86_64`, `armv7`, `arm`, `armv5te`, `mipsel`), strips symbols, and publishes both versioned archives and stable asset names (`usque-rs-aarch64-linux-musl.tar.gz`, `usque-rs-aarch64-linux-musl.tar.gz.sha256`) to GitHub Releases so `router-script` can fetch and verify them automatically.
+
+## Handoff to `router-script` for deployment and runtime flags
+
+Once a release artifact is published from `usque-rs-openwrt`, all router-side rollout, `--mtu` / TCP MSS clamping adjustments, and live verification belong to `/Users/atharva/projects/router-script`. Always ask the user to delegate deployment and router-script changes to the `router-script` agent and generate a tailored prompt for it.
 
 ## Sources
 
