@@ -14,7 +14,7 @@ On long-lived sessions over shared links, `bbr2` maintains steady throughput wit
 
 `quiche::Connection::send()` returns a `SendInfo` containing an `at: Instant` pacing deadline. Emitting future-scheduled packets immediately causes micro-bursts, UDP socket drops, and congestion-window collapse.
 
-`src/tunnel.rs` retains a future-scheduled outbound QUIC packet until its `SendInfo::at` deadline and exposes that deadline as a first-class timer branch in the main `tokio::select!` loop. While waiting for a paced send deadline, the loop continues servicing inbound UDP datagrams and TUN packets.
+`src/tunnel.rs` coalesces sub-millisecond pacing deadlines (`< 500 µs`, below Tokio's 1 ms timer-wheel resolution) into the active `UdpSendBatch` (`[I3]`, flushed via a single `sendmmsg(2)` syscall on Linux) and retains future-scheduled packets (`>= 500 µs`) in a pre-allocated buffer until their `SendInfo::at` timer branch fires in `tokio::select!`. Outbound TUN reads also drain up to `MAX_FORWARDING_BATCH` (64) ready packets per wakeup via `try_read_tun_packet`.
 
 ## ACK-eliciting keepalives and dead-peer detection
 

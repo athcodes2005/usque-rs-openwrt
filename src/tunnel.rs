@@ -40,6 +40,11 @@ const MIN_EVENT_LOOP_SLEEP: Duration = Duration::from_millis(5);
 // an unbounded UDP drain can remain readable indefinitely during a download,
 // starving decoded datagrams, TUN writes, and QUIC ACK transmission.
 const MAX_FORWARDING_BATCH: usize = 64;
+// Tokio's timer wheel ticks at 1 ms resolution. Sub-millisecond pacing gaps
+// (< 500 µs, which occur whenever quiche paces above ~21 Mbit/s) cannot be
+// slept on accurately in user space without stalling the send loop for a full
+// >= 1 ms timer tick per packet; coalesce them into the current send batch.
+const PACING_COALESCE_WINDOW: Duration = Duration::from_micros(500);
 // A failed TUN write loses that one packet. Writes that keep failing mean the
 // device is gone, so the session ends instead of silently dropping all traffic.
 const MAX_CONSECUTIVE_TUN_WRITE_FAILURES: u32 = 32;
@@ -322,7 +327,157 @@ const fn forwarding_batch_limit_reached(index: usize) -> bool {
 }
 
 fn pacing_delay(send_at: Instant, now: Instant) -> Duration {
-    send_at.saturating_duration_since(now)
+    let delay = send_at.saturating_duration_since(now);
+    if delay < PACING_COALESCE_WINDOW {
+        Duration::ZERO
+    } else {
+        delay
+    }
+}
+
+fn noop_waker() -> std::task::Waker {
+    const VTABLE: std::task::RawWakerVTable =
+        std::task::RawWakerVTable::new(|_| RAW, |_| {}, |_| {}, |_| {});
+    const RAW: std::task::RawWaker = std::task::RawWaker::new(std::ptr::null(), &VTABLE);
+    // Safety: all vtable functions are no-ops that never dereference the data pointer.
+    unsafe { std::task::Waker::from_raw(RAW) }
+}
+
+/// Non-blocking poll for an additional packet already buffered in the TUN
+/// reader so a single `tokio::select!` wakeup can drain a burst of up to
+/// `MAX_FORWARDING_BATCH` outbound packets before encoding and flushing QUIC
+/// UDP datagrams.
+fn try_read_tun_packet<R>(tun_reader: &mut R, buf: &mut [u8]) -> std::io::Result<Option<usize>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let waker = noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut read_buf = tokio::io::ReadBuf::new(buf);
+    match std::pin::Pin::new(tun_reader).poll_read(&mut cx, &mut read_buf) {
+        std::task::Poll::Ready(Ok(())) => Ok(Some(read_buf.filled().len())),
+        std::task::Poll::Ready(Err(error)) => Err(error),
+        std::task::Poll::Pending => Ok(None),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_batch_mmsg(
+    socket: &tokio::net::UdpSocket,
+    buffers: &[[u8; MAX_DATAGRAM_SIZE]],
+    lengths: &[usize],
+) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+
+    let count = lengths.len();
+    let mut iovecs: [libc::iovec; MAX_FORWARDING_BATCH] = unsafe { std::mem::zeroed() };
+    let mut hdrs: [libc::mmsghdr; MAX_FORWARDING_BATCH] = unsafe { std::mem::zeroed() };
+
+    for i in 0..count {
+        iovecs[i] = libc::iovec {
+            iov_base: buffers[i].as_ptr().cast_mut().cast(),
+            iov_len: lengths[i],
+        };
+        hdrs[i].msg_hdr.msg_iov = std::ptr::addr_of_mut!(iovecs[i]);
+        hdrs[i].msg_hdr.msg_iovlen = 1;
+    }
+
+    socket.try_io(tokio::io::Interest::WRITABLE, || {
+        let sent = unsafe {
+            libc::sendmmsg(
+                socket.as_raw_fd(),
+                hdrs.as_mut_ptr(),
+                u32::try_from(count).unwrap_or(u32::MAX),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if sent < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(sent as usize)
+        }
+    })
+}
+
+/// Pre-allocated batch of outbound QUIC UDP datagrams (`[I3]`).
+/// On Linux (`target_os = "linux"`), flushes a multi-packet batch in a single
+/// `sendmmsg(2)` syscall, falling back to per-packet async sends only when the
+/// kernel socket buffer partially fills (`EAGAIN`).
+struct UdpSendBatch {
+    peer: SocketAddr,
+    buffers: Vec<[u8; MAX_DATAGRAM_SIZE]>,
+    lengths: [usize; MAX_FORWARDING_BATCH],
+    dests: [SocketAddr; MAX_FORWARDING_BATCH],
+    count: usize,
+}
+
+impl UdpSendBatch {
+    fn new(peer: SocketAddr) -> Self {
+        Self {
+            peer,
+            buffers: vec![[0u8; MAX_DATAGRAM_SIZE]; MAX_FORWARDING_BATCH],
+            lengths: [0; MAX_FORWARDING_BATCH],
+            dests: [peer; MAX_FORWARDING_BATCH],
+            count: 0,
+        }
+    }
+
+    const fn is_full(&self) -> bool {
+        self.count >= MAX_FORWARDING_BATCH
+    }
+
+    fn next_buf_mut(&mut self) -> &mut [u8; MAX_DATAGRAM_SIZE] {
+        &mut self.buffers[self.count]
+    }
+
+    fn commit(&mut self, len: usize, to: SocketAddr) {
+        self.lengths[self.count] = len;
+        self.dests[self.count] = to;
+        self.count += 1;
+    }
+
+    fn push(&mut self, packet: &[u8], to: SocketAddr) {
+        self.buffers[self.count][..packet.len()].copy_from_slice(packet);
+        self.commit(packet.len(), to);
+    }
+
+    async fn flush(&mut self, socket: &tokio::net::UdpSocket) {
+        if self.count == 0 {
+            return;
+        }
+        let total = self.count;
+        self.count = 0;
+
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut start = 0;
+        #[cfg(target_os = "linux")]
+        if total > 1 && self.dests[..total].iter().all(|&d| d == self.peer) {
+            match send_batch_mmsg(socket, &self.buffers[..total], &self.lengths[..total]) {
+                Ok(sent) => {
+                    start = sent;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    log::warn!("UDP batch send error: {error}");
+                    return;
+                }
+            }
+        }
+
+        for i in start..total {
+            let packet = &self.buffers[i][..self.lengths[i]];
+            let dest = self.dests[i];
+            let res = if dest == self.peer {
+                socket.send(packet).await
+            } else {
+                socket.send_to(packet, dest).await
+            };
+            if let Err(error) = res {
+                log::warn!("UDP send error: {error}");
+                break;
+            }
+        }
+    }
 }
 
 async fn write_tun<W>(
@@ -345,6 +500,61 @@ where
                 bail!("{failures} consecutive TUN writes failed: {error}");
             }
             log::debug!("TUN write failed: {error}");
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn queue_tun_packet<W>(
+    pkt: &mut [u8],
+    flow_prefix: &[u8],
+    conn: &mut quiche::Connection,
+    stats: &Stats,
+    upload_queue: &mut Option<UploadQueue>,
+    tun_writer: &mut W,
+    tun_write_failures: &mut u32,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match packet::prepare_outgoing(pkt) {
+        Ok(_) => {
+            let pkt_len = pkt.len() as u64;
+            let mut dgram = Vec::with_capacity(flow_prefix.len() + pkt.len());
+            dgram.extend_from_slice(flow_prefix);
+            dgram.extend_from_slice(pkt);
+
+            let dgram_len = dgram.len();
+            match conn.dgram_send_vec(dgram) {
+                Ok(()) => {
+                    stats.tx_packets.fetch_add(1, Ordering::Relaxed);
+                    stats.tx_bytes.fetch_add(pkt_len, Ordering::Relaxed);
+                    if let Some(queue) = upload_queue.as_mut() {
+                        queue.push(Instant::now(), dgram_len);
+                    }
+                }
+                Err(quiche::Error::InvalidState) => {
+                    log::warn!("datagram send: peer doesn't support datagrams");
+                }
+                Err(quiche::Error::Done) => {
+                    stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    log::trace!("datagram send queue full, dropping packet");
+                }
+                Err(e) => {
+                    stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    log::debug!("datagram send error: {e}, generating ICMP");
+                    let icmp_mtu =
+                        effective_datagram_ip_mtu(conn.dgram_max_writable_len(), flow_prefix.len());
+                    if let Some(icmp_pkt) = icmp::compose_icmp_too_large(pkt, icmp_mtu) {
+                        write_tun(tun_writer, &icmp_pkt, stats, tun_write_failures).await?;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            stats.dropped.fetch_add(1, Ordering::Relaxed);
+            log::trace!("dropping outgoing packet: {e}");
         }
     }
     Ok(())
@@ -884,7 +1094,9 @@ where
     let mut last_keepalive = Instant::now();
     let mut last_quic_stats_update = Instant::now();
     let mut internal_work_pending = false;
-    let mut paced_packet: Option<(Vec<u8>, quiche::SendInfo)> = None;
+    let mut paced_buf = vec![0u8; MAX_DATAGRAM_SIZE];
+    let mut paced_packet: Option<(usize, quiche::SendInfo)> = None;
+    let mut send_batch = UdpSendBatch::new(tunnel_cfg.endpoint);
     let mut tun_write_failures = 0;
     // With --upload-codel, upload datagrams that wait too long are dropped.
     let mut upload_queue = (!tunnel_cfg.upload_codel.is_zero()).then(|| {
@@ -902,6 +1114,9 @@ where
             .map_or(keepalive_interval, |(_, info)| {
                 pacing_delay(info.at, Instant::now())
             });
+        let continue_batch = internal_work_pending;
+        internal_work_pending = false;
+        let mut tun_reads_this_turn = 0usize;
 
         tokio::select! {
             // Read from TUN -> send to QUIC
@@ -911,57 +1126,17 @@ where
                 if n == 0 {
                     bail!("TUN device closed");
                 }
-
-                let pkt = &mut tun_buf[..n];
-                match packet::prepare_outgoing(pkt) {
-                    Ok(_) => {
-                        let pkt_len = n as u64;
-                        let mut dgram = Vec::with_capacity(flow_prefix.len() + n);
-                        dgram.extend_from_slice(&flow_prefix);
-                        dgram.extend_from_slice(pkt);
-
-                        let dgram_len = dgram.len();
-                        match conn.dgram_send_vec(dgram) {
-                            Ok(()) => {
-                                stats.tx_packets.fetch_add(1, Ordering::Relaxed);
-                                stats.tx_bytes.fetch_add(pkt_len, Ordering::Relaxed);
-                                if let Some(queue) = upload_queue.as_mut() {
-                                    queue.push(Instant::now(), dgram_len);
-                                }
-                            }
-                            Err(quiche::Error::InvalidState) => {
-                                log::warn!("datagram send: peer doesn't support datagrams");
-                            }
-                            Err(quiche::Error::Done) => {
-                                stats.dropped.fetch_add(1, Ordering::Relaxed);
-                                log::trace!("datagram send queue full, dropping packet");
-                            }
-                            Err(e) => {
-                                stats.dropped.fetch_add(1, Ordering::Relaxed);
-                                log::debug!("datagram send error: {e}, generating ICMP");
-                                let icmp_mtu = effective_datagram_ip_mtu(
-                                    conn.dgram_max_writable_len(),
-                                    flow_prefix.len(),
-                                );
-                                if let Some(icmp_pkt) =
-                                    icmp::compose_icmp_too_large(&tun_buf[..n], icmp_mtu)
-                                {
-                                    write_tun(
-                                        tun_writer,
-                                        &icmp_pkt,
-                                        &stats,
-                                        &mut tun_write_failures,
-                                    )
-                                    .await?;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        stats.dropped.fetch_add(1, Ordering::Relaxed);
-                        log::trace!("dropping outgoing packet: {e}");
-                    }
-                }
+                queue_tun_packet(
+                    &mut tun_buf[..n],
+                    &flow_prefix,
+                    &mut conn,
+                    &stats,
+                    &mut upload_queue,
+                    tun_writer,
+                    &mut tun_write_failures,
+                )
+                .await?;
+                tun_reads_this_turn = 1;
             }
 
             // Read from QUIC socket
@@ -984,21 +1159,45 @@ where
             // Continue a capped internal batch without waiting for a new
             // socket/TUN event. yield_now keeps this branch cooperative and
             // lets the other ready branches win fairly.
-            () = tokio::task::yield_now(), if internal_work_pending => {}
+            () = tokio::task::yield_now(), if continue_batch => {}
 
             // quiche's SendInfo::at is a congestion-control pacing deadline.
             // Holding one packet until that deadline prevents packet bursts,
             // loss-recovery collapse, and a compute-only conn.send() loop.
             () = tokio::time::sleep(paced_send_delay), if paced_packet.is_some() => {
-                let (packet, send_info) = paced_packet
+                let (len, send_info) = paced_packet
                     .take()
                     .expect("paced packet must exist when its timer is enabled");
-                if let Err(error) = socket.send_to(&packet, send_info.to).await {
-                    log::warn!("paced UDP send error: {error}");
-                }
+                send_batch.push(&paced_buf[..len], send_info.to);
             }
         }
-        internal_work_pending = false;
+
+        // Drain any additional ready TUN packets up to MAX_FORWARDING_BATCH so
+        // an upload burst is queued into quiche and sent in one UDP batch.
+        for index in tun_reads_this_turn..MAX_FORWARDING_BATCH {
+            if !tun_read_allowed(conn.dgram_send_queue_len(), tunnel_cfg.tun_backpressure) {
+                break;
+            }
+            match try_read_tun_packet(tun_reader, &mut tun_buf)? {
+                Some(0) => bail!("TUN device closed"),
+                Some(n) => {
+                    queue_tun_packet(
+                        &mut tun_buf[..n],
+                        &flow_prefix,
+                        &mut conn,
+                        &stats,
+                        &mut upload_queue,
+                        tun_writer,
+                        &mut tun_write_failures,
+                    )
+                    .await?;
+                    if forwarding_batch_limit_reached(index) {
+                        internal_work_pending = true;
+                    }
+                }
+                None => break,
+            }
+        }
 
         // Keep the campus/WAN UDP mapping alive and make a dead peer observable
         // even while no client packets are crossing the tunnel.
@@ -1082,20 +1281,23 @@ where
             drop_stale_uploads(queue, &mut conn, &stats);
         }
 
-        // Flush an immediately-due QUIC batch. If quiche schedules a packet in
-        // the future, retain that packet and resume output from the select loop
-        // when its pacing deadline arrives.
+        // Collect all immediately-due QUIC packets into send_batch and flush
+        // them in one batched syscall (sendmmsg on Linux). If quiche schedules
+        // a packet >= PACING_COALESCE_WINDOW in the future, retain it in the
+        // pre-allocated paced_buf and resume when its pacing timer fires.
         if paced_packet.is_none() {
-            for index in 0..MAX_FORWARDING_BATCH {
-                match conn.send(&mut out) {
+            let now = Instant::now();
+            while !send_batch.is_full() {
+                match conn.send(send_batch.next_buf_mut()) {
                     Ok((write, send_info)) => {
-                        if pacing_delay(send_info.at, Instant::now()).is_zero() {
-                            if let Err(e) = socket.send_to(&out[..write], send_info.to).await {
-                                log::warn!("UDP send error: {e}");
-                                break;
+                        if pacing_delay(send_info.at, now).is_zero() {
+                            send_batch.commit(write, send_info.to);
+                            if send_batch.is_full() {
+                                internal_work_pending = true;
                             }
                         } else {
-                            paced_packet = Some((out[..write].to_vec(), send_info));
+                            paced_buf[..write].copy_from_slice(&send_batch.next_buf_mut()[..write]);
+                            paced_packet = Some((write, send_info));
                             break;
                         }
                     }
@@ -1105,11 +1307,9 @@ where
                         bail!("quic send error: {e}");
                     }
                 }
-                if forwarding_batch_limit_reached(index) {
-                    internal_work_pending = true;
-                }
             }
         }
+        send_batch.flush(&socket).await;
 
         // Stats are display-only; avoid querying the connection on every packet.
         if last_quic_stats_update.elapsed() >= Duration::from_secs(1) {
@@ -1821,18 +2021,28 @@ mod tests {
     fn pacing_delay_waits_for_future_packets_without_rewaiting_past_packets() {
         let now = Instant::now();
         assert_eq!(pacing_delay(now, now), Duration::ZERO);
+        // Sub-millisecond pacing deadlines (< PACING_COALESCE_WINDOW = 500 µs)
+        // coalesce into the current send batch instead of sleeping on Tokio's
+        // 1 ms timer wheel.
+        assert_eq!(
+            pacing_delay(now + Duration::from_micros(250), now),
+            Duration::ZERO
+        );
+        assert_eq!(
+            pacing_delay(now + Duration::from_micros(499), now),
+            Duration::ZERO
+        );
+        assert_eq!(
+            pacing_delay(now + Duration::from_micros(500), now),
+            Duration::from_micros(500)
+        );
         assert_eq!(
             pacing_delay(now + Duration::from_millis(25), now),
             Duration::from_millis(25)
         );
-        assert_eq!(
-            pacing_delay(
-                now.checked_sub(Duration::from_millis(25))
-                    .expect("test instant should allow a 25 ms subtraction"),
-                now
-            ),
-            Duration::ZERO
-        );
+        // Avoid Instant::checked_sub on fresh CI VMs with small monotonic uptime.
+        let later = now + Duration::from_millis(25);
+        assert_eq!(pacing_delay(now, later), Duration::ZERO);
     }
 
     // ---- WARP audit optimizations: I1 (asymmetric dgram queues), I4 (PMTUD), I2 (0-RTT) ----
@@ -2122,5 +2332,66 @@ mod tests {
         let mut invalid = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
         assert!(!restore_quic_session(&mut client, &mut invalid));
         assert!(invalid.is_none());
+    }
+
+    #[tokio::test]
+    async fn udp_send_batch_flushes_all_queued_datagrams_in_order() {
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind sender");
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind receiver");
+        let dest = receiver.local_addr().expect("receiver addr");
+        sender.connect(dest).await.expect("connect sender");
+
+        let mut batch = UdpSendBatch::new(dest);
+        for id in 0..16u8 {
+            let payload = [id; 64];
+            let slot = batch.next_buf_mut();
+            slot[..payload.len()].copy_from_slice(&payload);
+            batch.commit(payload.len(), dest);
+        }
+        batch.push(&[99u8; 32], dest);
+        batch.flush(&sender).await;
+
+        let mut buf = [0u8; 128];
+        for id in 0..16u8 {
+            let (len, _) = receiver.recv_from(&mut buf).await.expect("recv batch item");
+            assert_eq!(&buf[..len], &[id; 64]);
+        }
+        let (len, _) = receiver
+            .recv_from(&mut buf)
+            .await
+            .expect("recv pushed item");
+        assert_eq!(&buf[..len], &[99u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn try_read_tun_packet_drains_ready_burst_and_returns_none_when_empty() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let mut buf = [0u8; 64];
+
+        assert_eq!(
+            try_read_tun_packet(&mut reader, &mut buf).expect("empty poll"),
+            None
+        );
+
+        writer.write_all(b"pkt1").await.expect("write pkt1");
+        let n1 = try_read_tun_packet(&mut reader, &mut buf)
+            .expect("poll pkt1")
+            .expect("some pkt1");
+        assert_eq!(&buf[..n1], b"pkt1");
+        assert_eq!(
+            try_read_tun_packet(&mut reader, &mut buf).expect("empty after drain"),
+            None
+        );
+
+        // Subsequent async read still wakes up normally when new data arrives.
+        writer.write_all(b"pkt2").await.expect("write pkt2");
+        let n2 = reader.read(&mut buf).await.expect("async read pkt2");
+        assert_eq!(&buf[..n2], b"pkt2");
     }
 }

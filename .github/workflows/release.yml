@@ -116,5 +116,5 @@ jobs:
             ${{ steps.pkg.outputs.archive }}.sha256
             ${{ steps.pkg.outputs.stable_archive }}
             ${{ steps.pkg.outputs.stable_archive }}.sha256
-          generate_release_notes: true
+          generate_release_notes: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
           fail_on_unmatched_files: true
