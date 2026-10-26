@@ -4,8 +4,12 @@ on:
   push:
     tags:
       - "v*.*.*"
-    branches:
-      - "release"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create/update (e.g. v0.2.0)"
+        required: true
+        default: "v0.2.0"
 
 permissions:
   contents: write
@@ -106,7 +110,7 @@ jobs:
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             ${{ steps.pkg.outputs.archive }}
             ${{ steps.pkg.outputs.archive }}.sha256
