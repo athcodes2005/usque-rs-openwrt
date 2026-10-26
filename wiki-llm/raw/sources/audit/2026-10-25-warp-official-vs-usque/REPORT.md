@@ -252,7 +252,7 @@ setup has worked; treat this as an idea, not a recommendation.
 
 - **65,536-deep send queue** — would make F10 much worse (§3).
 - **`cwnd_max` / `congestion_window_unchecked`** — disables CC discipline;
-  hostile to any shared uplink (our campus). Even Cloudflare doesn't default
+  hostile to any shared uplink. Even Cloudflare doesn't default
   to it.
 - **BBR2-by-default** — the official default is cubic; `bbr2_gcongestion` is
   an MDM opt-in. We already expose bbr2 behind `--congestion-control`;

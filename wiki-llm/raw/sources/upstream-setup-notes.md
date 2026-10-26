@@ -8,7 +8,7 @@ I wanted to set up WARP as the default IPv6 exit for my home internet since my I
 
 0. `opkg update && install kmod-tun` - this is important, make sure that `lsmod | grep tun` shows the loaded kernel module after!
 1. Created the work dir: `mkdir /root/usque`
-2. Moved the extracted binary: `cat ./usque-rs | ssh root@192.168.1.1 "cat > /root/usque/usque-rs && chmod +x /root/usque/usque-rs"`
+2. Moved the extracted binary: `cat ./usque-rs | ssh root@<router-ip> "cat > /root/usque/usque-rs && chmod +x /root/usque/usque-rs"`
 3. Ran the login: `cd /root/usque && ./usque-rs login`, accepted EULA
 4. Ran `vi /etc/init.d/usque-rs`:
 ```sh

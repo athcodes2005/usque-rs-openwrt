@@ -20,7 +20,7 @@ A reverse-engineering audit of Cloudflare's unstripped Linux daemon (`warp-svc` 
 - **Do not copy `warp-svc`'s `65,536` send queue:** ~88 MiB of unmanaged client buffering causes severe upload bufferbloat on router CPUs (`F10`).
 - **Do not enable `cwnd_max`:** disables congestion control on shared links.
 
-## Live router benchmark results (GL-MT3000, `bbr2`, `MTU 1320`)
+## Live router benchmark results (OpenWrt aarch64 router, `bbr2`, `MTU 1320`)
 
 | Metric | `v0.2.0` (per-packet `send_to`) | `v0.2.1` (`sendmmsg` + `500 µs` pacing coalescing) | Delta |
 |---|---|---|---|
@@ -29,9 +29,12 @@ A reverse-engineering audit of Cloudflare's unstripped Linux daemon (`warp-svc` 
 | Upload loaded RTT (min / med / max) | `27 / 46 / 67 ms` | `13 / 19 / 28 ms` | **`-59%` median upload lag** |
 | Download loaded RTT (min / med / max) | `8 / 23 / 54 ms` | `5 / 5 / 14 ms` | **`0 ms` median download bloat** |
 
+## Evidence removal note
+
+On 2026-10-26 the evidence files derived from Cloudflare's proprietary `warp-svc` binary (`*-disasm.txt`, `warp-svc-strings.txt.gz`, `deb-inventory.txt`, `digests.txt`, `architecture-symbols.txt`) were removed from the public working tree; git history still contains them. References to them in the raw `REPORT.md` / `HANDOFF.md` are therefore dangling and left as-is. Only `evidence/upstream/` (open-source quiche / tokio-quiche snapshots, with `ORIGIN.md`) remains.
+
 ## Sources
 
 - `../../raw/sources/audit/2026-10-25-warp-official-vs-usque/HANDOFF.md`
 - `../../raw/sources/audit/2026-10-25-warp-official-vs-usque/REPORT.md`
-- `../../raw/sources/audit/2026-10-25-warp-official-vs-usque/evidence/quicsettings-default-disasm.txt`
 - `../../../src/tunnel.rs`

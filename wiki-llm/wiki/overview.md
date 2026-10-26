@@ -15,7 +15,7 @@ Routing policy, firewall rules, DNS, and watchdog orchestration belong to extern
 
 ## Delegation contract with `router-script`
 
-Agents working in `usque-rs-openwrt` own only the Rust crate, its tests, and GitHub Release artifacts. For any router deployment, binary delivery (`fetch_usque_rs.sh` / `sync_to_router.sh`), runtime CLI flag changes (`tunnel.sh`), or TUN MTU / TCP MSS clamping updates (`defaults.sh`, `tunnel.sh`, `ensure_network.sh`), **do not edit `/Users/atharva/projects/router-script` or access the router directly**—ask the user to delegate that work to the agent in `router-script` and provide a self-contained handoff prompt.
+Agents working in `usque-rs-openwrt` own only the Rust crate, its tests, and GitHub Release artifacts. For any router deployment, binary delivery (`fetch_usque_rs.sh` / `sync_to_router.sh`), runtime CLI flag changes (`tunnel.sh`), or TUN MTU / TCP MSS clamping updates (`defaults.sh`, `tunnel.sh`, `ensure_network.sh`), **do not edit the `router-script` repository or access the router directly**—ask the user to delegate that work to the agent in `router-script` and provide a self-contained handoff prompt.
 
 ## CLI options (`nativetun`)
 

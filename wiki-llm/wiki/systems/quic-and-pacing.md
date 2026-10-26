@@ -5,7 +5,7 @@
 `--congestion-control` exposes `quiche`'s four congestion control algorithms:
 - `cubic` (default for upstream compatibility)
 - `bbr`
-- `bbr2` (recommended on shared/campus wireless and router uplinks)
+- `bbr2` (recommended on shared wireless and router uplinks)
 - `reno`
 
 On long-lived sessions over shared links, `bbr2` maintains steady throughput with minimal UDP receive backlog and lower CPU usage than `cubic`.

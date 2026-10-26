@@ -1200,7 +1200,7 @@ where
             }
         }
 
-        // Keep the campus/WAN UDP mapping alive and make a dead peer observable
+        // Keep the WAN UDP/NAT mapping alive and make a dead peer observable
         // even while no client packets are crossing the tunnel.
         if last_keepalive.elapsed() >= keepalive_interval {
             if let Err(error) = conn.send_ack_eliciting() {

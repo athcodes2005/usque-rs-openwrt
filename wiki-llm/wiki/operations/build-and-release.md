@@ -22,7 +22,7 @@ docker run --rm \
 
 ## Handoff to `router-script` for deployment and runtime flags
 
-Once a release artifact is published from `usque-rs-openwrt`, all router-side rollout, `--mtu` / TCP MSS clamping adjustments, and live verification belong to `/Users/atharva/projects/router-script`. Always ask the user to delegate deployment and router-script changes to the `router-script` agent and generate a tailored prompt for it.
+Once a release artifact is published from `usque-rs-openwrt`, all router-side rollout, `--mtu` / TCP MSS clamping adjustments, and live verification belong to the `router-script` repository. Always ask the user to delegate deployment and router-script changes to the `router-script` agent and generate a tailored prompt for it.
 
 ## Sources
 
