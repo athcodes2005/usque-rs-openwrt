@@ -110,6 +110,10 @@ enum Commands {
         /// this many milliseconds to be sent (0 disables)
         #[arg(long, value_name = "MS", default_value_t = 0)]
         upload_codel: u64,
+        /// Receive buffer for the QUIC UDP socket, so download bursts are not
+        /// dropped by the kernel (Linux only; 0 keeps the kernel default)
+        #[arg(long, value_name = "BYTES", default_value_t = 4_194_304)]
+        udp_recv_buffer: usize,
         /// Also send connection events (connecting, connected, why a session
         /// ended, fatal errors) to the system log
         #[arg(long, default_value_t = false)]
@@ -144,6 +148,7 @@ async fn main() -> Result<()> {
             ready_file,
             tun_backpressure,
             upload_codel,
+            udp_recv_buffer,
             syslog,
         } => {
             if syslog {
@@ -169,6 +174,7 @@ async fn main() -> Result<()> {
                 ready_file,
                 tun_backpressure,
                 Duration::from_millis(upload_codel),
+                udp_recv_buffer,
             )
             .await;
             // main reports the error on stderr itself; syslog needs a copy.
@@ -241,6 +247,7 @@ async fn cmd_nativetun(
     ready_file: Option<String>,
     tun_backpressure: usize,
     upload_codel: Duration,
+    udp_recv_buffer: usize,
 ) -> Result<()> {
     if keepalive_period.is_zero() {
         anyhow::bail!("keepalive period must be at least one second");
@@ -287,6 +294,7 @@ async fn cmd_nativetun(
         ready_file,
         tun_backpressure,
         upload_codel,
+        udp_recv_buffer,
     };
 
     tunnel::maintain_tunnel(&cfg, &tunnel_cfg, tun_dev).await
@@ -319,6 +327,32 @@ mod tests {
         assert_eq!(
             target(&["usque-rs", "nativetun", "--upload-codel", "20"]),
             20
+        );
+    }
+
+    #[test]
+    fn nativetun_lists_the_udp_recv_buffer_for_tunnel_sh() {
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("nativetun")
+            .expect("nativetun subcommand")
+            .render_help()
+            .to_string();
+        assert!(help.contains("--udp-recv-buffer <BYTES>"), "{help}");
+    }
+
+    #[test]
+    fn the_udp_recv_buffer_defaults_to_four_mebibytes() {
+        let target = |args: &[&str]| match Cli::parse_from(args.iter().copied()).command {
+            Commands::NativeTun {
+                udp_recv_buffer, ..
+            } => udp_recv_buffer,
+            Commands::Register { .. } => unreachable!("parsed nativetun"),
+        };
+        assert_eq!(target(&["usque-rs", "nativetun"]), 4 * 1024 * 1024);
+        assert_eq!(
+            target(&["usque-rs", "nativetun", "--udp-recv-buffer", "0"]),
+            0
         );
     }
 }

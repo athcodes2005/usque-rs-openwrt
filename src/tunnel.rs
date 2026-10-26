@@ -573,6 +573,118 @@ async fn send_paced_packet(
     socket.send_to(packet, send_info.to).await
 }
 
+/// What `set_udp_recv_buffer` achieved.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct RecvBuffer {
+    /// `SO_RCVBUF` as the kernel reports it (twice the requested size).
+    effective: usize,
+    /// Whether `SO_RCVBUFFORCE` was accepted, which ignores `rmem_max`.
+    forced: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn recv_buffer_size(fd: std::os::fd::RawFd) -> std::io::Result<usize> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `value` and `len` are valid for the duration of the call.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::addr_of_mut!(value).cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(value.max(0) as usize)
+}
+
+#[cfg(target_os = "linux")]
+fn setsockopt_rcvbuf(
+    fd: std::os::fd::RawFd,
+    option: libc::c_int,
+    bytes: libc::c_int,
+) -> std::io::Result<()> {
+    // SAFETY: `bytes` is valid for the duration of the call.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            std::ptr::addr_of!(bytes).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Request a `bytes` receive buffer: `SO_RCVBUFFORCE` first (needs
+/// `CAP_NET_ADMIN`, ignores `rmem_max`), then `SO_RCVBUF` if that is refused.
+/// Zero only reads the current size.
+#[cfg(target_os = "linux")]
+fn set_udp_recv_buffer(fd: std::os::fd::RawFd, bytes: usize) -> std::io::Result<RecvBuffer> {
+    let mut forced = false;
+    if bytes > 0 {
+        let bytes = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
+        match setsockopt_rcvbuf(fd, libc::SO_RCVBUFFORCE, bytes) {
+            Ok(()) => forced = true,
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                setsockopt_rcvbuf(fd, libc::SO_RCVBUF, bytes)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(RecvBuffer {
+        effective: recv_buffer_size(fd)?,
+        forced,
+    })
+}
+
+/// Enlarge the QUIC socket's receive buffer so download bursts are not
+/// dropped by the kernel. Never fails the session.
+#[cfg(target_os = "linux")]
+fn apply_udp_recv_buffer(socket: &tokio::net::UdpSocket, bytes: usize) {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+
+    if bytes == 0 {
+        return;
+    }
+    match set_udp_recv_buffer(socket.as_raw_fd(), bytes) {
+        Ok(buffer) => {
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                events::event(
+                    Severity::Info,
+                    &format!(
+                        "UDP receive buffer is {} bytes (requested {bytes}{})",
+                        buffer.effective,
+                        if buffer.forced {
+                            ""
+                        } else {
+                            ", capped by rmem_max"
+                        },
+                    ),
+                );
+            }
+        }
+        Err(e) => events::event(
+            Severity::Warning,
+            &format!("could not set the UDP receive buffer, using the kernel default: {e}"),
+        ),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn apply_udp_recv_buffer(_socket: &tokio::net::UdpSocket, _bytes: usize) {}
+
 /// Configuration for a MASQUE tunnel session.
 pub struct TunnelConfig {
     pub endpoint: SocketAddr,
@@ -586,6 +698,9 @@ pub struct TunnelConfig {
     /// Target queueing delay for upload datagrams (controlled delay); zero
     /// disables.
     pub upload_codel: Duration,
+    /// Receive buffer to request for the QUIC UDP socket, in bytes; 0 keeps
+    /// the kernel default. Only applied on Linux.
+    pub udp_recv_buffer: usize,
 }
 
 struct AbortTaskOnDrop(tokio::task::JoinHandle<()>);
@@ -832,6 +947,7 @@ where
     };
 
     let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
+    apply_udp_recv_buffer(&socket, tunnel_cfg.udp_recv_buffer);
     socket.connect(tunnel_cfg.endpoint).await?;
     let local_addr = socket.local_addr()?;
 
@@ -1368,6 +1484,40 @@ pub(crate) fn parse_datagram(dgram: &[u8], expected_flow_id: u64) -> Option<&[u8
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(target_os = "linux")]
+    mod recv_buffer {
+        use super::super::*;
+        use std::os::fd::AsRawFd;
+
+        const MIB: usize = 1 << 20;
+
+        #[test]
+        fn a_requested_buffer_is_applied_or_capped_by_rmem_max() {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let fd = socket.as_raw_fd();
+            let before = recv_buffer_size(fd).unwrap();
+            let buffer = set_udp_recv_buffer(fd, MIB).unwrap();
+            assert_eq!(buffer.effective, recv_buffer_size(fd).unwrap());
+            if buffer.forced {
+                // The kernel reports double the request.
+                assert!(buffer.effective >= MIB, "{buffer:?}");
+            } else {
+                // Unprivileged (CI) or without CAP_NET_ADMIN: capped by rmem_max.
+                assert!(buffer.effective >= before, "{buffer:?} vs {before}");
+            }
+        }
+
+        #[test]
+        fn zero_leaves_the_buffer_unchanged() {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let fd = socket.as_raw_fd();
+            let before = recv_buffer_size(fd).unwrap();
+            let buffer = set_udp_recv_buffer(fd, 0).unwrap();
+            assert_eq!(buffer.effective, before);
+            assert!(!buffer.forced);
+        }
+    }
     use super::*;
 
     // ---- parse_datagram tests ----
