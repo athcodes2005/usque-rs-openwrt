@@ -17,8 +17,10 @@ Append new entries at the end.
   - `--upload-codel <MS>` CoDel queue-delay management and `--tun-backpressure <N>`.
   - Full IPv4 options-aware header validation/checksumming and production `src/pipeline_tests.rs` test suite (94 unit + 4 integration tests).
 - Set up `wiki-llm/` and updated `.github/workflows/release.yml` to publish verified static `aarch64-unknown-linux-musl` assets on `v*.*.*` tags and the `release` branch.
+- Fixed Rust 1.99 Clippy lints (`const fn ip_version`, `write_tun_packet` shared return), bumped crate metadata to `0.2.0`, and archived the official Cloudflare WARP (`warp-svc` 2026.8.2115.0) vs `usque-rs` comparative reverse-engineering audit under `audit/2026-10-25-warp-official-vs-usque/`.
 
 ## Sources
 
 - `../../src/`, `../../tests/tunnel_mtu.rs`
 - `../../.github/workflows/ci.yml`, `../../.github/workflows/release.yml`
+- `../../audit/2026-10-25-warp-official-vs-usque/HANDOFF.md`

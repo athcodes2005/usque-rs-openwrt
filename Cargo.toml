@@ -1,8 +1,12 @@
 [package]
 name = "usque-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Tiny Rust MASQUE (CONNECT-IP) client for Cloudflare WARP (unofficial)"
+description = "OpenWrt-optimized Rust MASQUE (CONNECT-IP over HTTP/3 & QUIC) client for Cloudflare WARP"
+repository = "https://github.com/athcodes2005/usque-rs-openwrt"
+homepage = "https://github.com/athcodes2005/usque-rs-openwrt"
+keywords = ["cloudflare", "warp", "masque", "quic", "openwrt"]
+categories = ["network-programming", "command-line-utilities"]
 license = "MIT"
 
 [[bin]]

@@ -323,7 +323,6 @@ where
     match tokio::io::AsyncWriteExt::write_all(tun_writer, packet).await {
         Ok(()) => {
             *failures = 0;
-            Ok(())
         }
         Err(error) => {
             stats.dropped.fetch_add(1, Ordering::Relaxed);
@@ -332,9 +331,9 @@ where
                 bail!("{failures} consecutive TUN writes failed: {error}");
             }
             log::debug!("TUN write failed: {error}");
-            Ok(())
         }
     }
+    Ok(())
 }
 
 async fn send_paced_packet(
