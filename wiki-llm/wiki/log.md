@@ -81,6 +81,12 @@ Append new entries at the end.
   (`src/events.rs`), confirmed with raw test messages on the router. Version
   0.2.5, 108 unit + 4 integration tests; not tagged yet.
 
+## 2026-11-12 — v0.2.5 released
+
+- v0.2.5 (the syslog timestamp) was tagged and built for all six targets
+  (aarch64 archive `42f10f86…`) and deployed to the router, where
+  `logread -e usque-rs` shows the client's events with their tag.
+
 ## Sources
 
 - `../../src/`, `../../tests/tunnel_mtu.rs`
