@@ -67,6 +67,20 @@ Append new entries at the end.
   the Go download (C4). See [[operations/build-and-release]]. 107 unit + 4
   integration tests on macOS; the reworked workflow has not run yet.
 
+## 2026-11-12 — v0.2.4 released; syslog tag fix (0.2.5)
+
+- v0.2.4 was tagged and built by the reworked workflow on its first run: all six
+  targets, published by the one `publish` job (aarch64 archive `52f98ac2…`).
+  Deployed to the router; two interleaved load-test rounds against v0.2.3 showed
+  no regression.
+- Found during that rollout: OpenWrt's `logd` drops the first 15 characters and
+  a space of a syslog message as its timestamp, whatever they are. The client
+  sent none, and `usque-rs[4845]: ` is exactly that long for a four-digit PID,
+  so such a process logged every event without its tag and
+  `logread -e usque-rs` showed nothing. Lines now carry an RFC 3164 timestamp
+  (`src/events.rs`), confirmed with raw test messages on the router. Version
+  0.2.5, 108 unit + 4 integration tests; not tagged yet.
+
 ## Sources
 
 - `../../src/`, `../../tests/tunnel_mtu.rs`

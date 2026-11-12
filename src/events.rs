@@ -48,13 +48,28 @@ impl Syslog {
 
     /// Drops the message if syslogd is down or its queue is full.
     fn send(&self, severity: Severity, message: &str) {
-        let line = syslog_line(severity, std::process::id(), message);
+        let stamp = syslog_timestamp(&chrono::Utc::now());
+        let line = syslog_line(severity, &stamp, std::process::id(), message);
         let _ = self.socket.send_to(line.as_bytes(), &self.path);
     }
 }
 
-fn syslog_line(severity: Severity, pid: u32, message: &str) -> String {
-    format!("<{}>usque-rs[{pid}]: {message}", severity.priority())
+/// The RFC 3164 timestamp, always 15 characters ("Nov  2 03:04:05").
+fn syslog_timestamp(now: &chrono::DateTime<chrono::Utc>) -> String {
+    now.format("%b %e %H:%M:%S").to_string()
+}
+
+/// A syslog line in the traditional form, timestamp included. `logd` on
+/// `OpenWrt` takes the first 15 characters and a space for that timestamp and
+/// drops them, whatever they are: without one, `usque-rs[4845]: ` (a four-digit
+/// PID makes it exactly that long) was dropped, and `logread -e usque-rs`
+/// missed every event of such a process. `logd` shows its own time, so UTC is
+/// fine.
+fn syslog_line(severity: Severity, timestamp: &str, pid: u32, message: &str) -> String {
+    format!(
+        "<{}>{timestamp} usque-rs[{pid}]: {message}",
+        severity.priority()
+    )
 }
 
 static SYSLOG: OnceLock<Syslog> = OnceLock::new();
@@ -100,20 +115,50 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    const STAMP: &str = "Nov 12 23:14:13";
+
     #[test]
-    fn syslog_lines_carry_the_daemon_priority_tag_and_pid() {
+    fn syslog_lines_carry_the_daemon_priority_timestamp_tag_and_pid() {
         assert_eq!(
-            syslog_line(Severity::Info, 42, "[connected] MASQUE tunnel established"),
-            "<30>usque-rs[42]: [connected] MASQUE tunnel established"
+            syslog_line(
+                Severity::Info,
+                STAMP,
+                42,
+                "[connected] MASQUE tunnel established"
+            ),
+            "<30>Nov 12 23:14:13 usque-rs[42]: [connected] MASQUE tunnel established"
         );
         assert_eq!(
             syslog_line(
                 Severity::Warning,
+                STAMP,
                 7,
                 "[error] no packets from the server for 90s"
             ),
-            "<28>usque-rs[7]: [error] no packets from the server for 90s"
+            "<28>Nov 12 23:14:13 usque-rs[7]: [error] no packets from the server for 90s"
         );
+    }
+
+    #[test]
+    fn the_timestamp_fills_the_slot_logd_strips_so_the_tag_survives() {
+        // logd drops 15 characters and a space after the priority. A
+        // four-digit PID made the bare tag exactly that long.
+        assert_eq!("usque-rs[4845]:".len(), 15);
+        for day in [2, 12] {
+            let now = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 11, day, 3, 4, 5)
+                .single()
+                .unwrap();
+            let stamp = syslog_timestamp(&now);
+            assert_eq!(stamp.len(), 15, "{stamp:?}");
+            let line = syslog_line(Severity::Info, &stamp, 4845, "[connecting] ...");
+            let after_priority = line.strip_prefix("<30>").unwrap();
+            assert_eq!(&after_priority[15..16], " ");
+            assert_eq!(&after_priority[16..], "usque-rs[4845]: [connecting] ...");
+        }
+        let second = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 11, 2, 3, 4, 5)
+            .single()
+            .unwrap();
+        assert_eq!(syslog_timestamp(&second), "Nov  2 03:04:05");
     }
 
     #[test]
@@ -129,8 +174,11 @@ mod tests {
             .send(Severity::Warning, "[error] lost");
         let mut buf = [0u8; 256];
         let len = receiver.recv(&mut buf).unwrap();
-        let expected = format!("<28>usque-rs[{}]: [error] lost", std::process::id());
-        assert_eq!(std::str::from_utf8(&buf[..len]).unwrap(), expected);
+        // "<28>", a 15-character timestamp and a space, then the tag.
+        let line = std::str::from_utf8(&buf[..len]).unwrap();
+        let expected = format!("usque-rs[{}]: [error] lost", std::process::id());
+        assert!(line.starts_with("<28>"), "{line}");
+        assert_eq!(&line[4 + 16..], expected);
     }
 
     #[test]
