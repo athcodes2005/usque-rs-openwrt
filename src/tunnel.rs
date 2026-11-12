@@ -322,6 +322,33 @@ fn event_loop_timeout(quic_timeout: Option<Duration>, keepalive: Duration) -> Du
         .max(MIN_EVENT_LOOP_SLEEP)
 }
 
+/// How long the handshake and CONNECT-wait loops sleep for quiche's timer:
+/// floored like the session loop's, since a zero timeout spins here too, and
+/// never past the deadline.
+fn handshake_loop_timeout(quic_timeout: Option<Duration>, remaining: Duration) -> Duration {
+    quic_timeout
+        .unwrap_or(Duration::from_millis(100))
+        .max(MIN_EVENT_LOOP_SLEEP)
+        .min(remaining)
+}
+
+/// Whether an expired quiche timer should run now, between events. The floor
+/// in `event_loop_timeout` makes the loop's sleep branch wait for 5 ms without
+/// a TUN or UDP event, which a busy tunnel never has, and `on_timeout` is the
+/// only place quiche handles probe timeouts, the idle timeout and the end of a
+/// draining connection. At most once per floor period, so a timer that
+/// `on_timeout` leaves expired still cannot spin the loop.
+fn expired_timer_due(quic_timeout: Option<Duration>, since_last_run: Duration) -> bool {
+    quic_timeout == Some(Duration::ZERO) && since_last_run >= MIN_EVENT_LOOP_SLEEP
+}
+
+fn run_expired_timers(conn: &mut quiche::Connection, last_run: &mut Instant) {
+    if expired_timer_due(conn.timeout(), last_run.elapsed()) {
+        conn.on_timeout();
+        *last_run = Instant::now();
+    }
+}
+
 const fn forwarding_batch_limit_reached(index: usize) -> bool {
     index + 1 == MAX_FORWARDING_BATCH
 }
@@ -985,10 +1012,7 @@ where
             bail!("timed out during QUIC handshake");
         }
         let remaining = HANDSHAKE_TIMEOUT.saturating_sub(handshake_started.elapsed());
-        let timeout = conn
-            .timeout()
-            .unwrap_or(Duration::from_millis(100))
-            .min(remaining);
+        let timeout = handshake_loop_timeout(conn.timeout(), remaining);
 
         tokio::select! {
             result = socket.recv(&mut buf) => {
@@ -1065,18 +1089,16 @@ where
         }
     }
 
-    // Wait for 2xx
+    // Wait for 2xx, until the deadline. A cap of 100 passes used to end this
+    // early: a run of zero quiche timeouts used them up within microseconds.
     let mut connect_established = false;
     let connect_started = Instant::now();
-    for _ in 0..100 {
+    loop {
         if connect_started.elapsed() >= HANDSHAKE_TIMEOUT {
             bail!("timed out waiting for CONNECT response");
         }
         let remaining = HANDSHAKE_TIMEOUT.saturating_sub(connect_started.elapsed());
-        let timeout = conn
-            .timeout()
-            .unwrap_or(Duration::from_millis(100))
-            .min(remaining);
+        let timeout = handshake_loop_timeout(conn.timeout(), remaining);
 
         tokio::select! {
             result = socket.recv(&mut buf) => {
@@ -1137,10 +1159,6 @@ where
         if conn.is_closed() {
             bail!("connection closed before CONNECT response");
         }
-    }
-
-    if !connect_established {
-        bail!("timed out waiting for CONNECT response");
     }
 
     if sent_in_early_data {
@@ -1209,6 +1227,7 @@ where
     let mut dgram_buf = vec![0u8; mtu + flow_prefix.len() + 128];
     let keepalive_interval = tunnel_cfg.keepalive_period;
     let mut last_keepalive = Instant::now();
+    let mut last_timer_run = Instant::now();
     let mut last_quic_stats_update = Instant::now();
     let mut internal_work_pending = false;
     let mut paced_buf = vec![0u8; MAX_DATAGRAM_SIZE];
@@ -1271,6 +1290,7 @@ where
             // Timeout handling
             () = tokio::time::sleep(timeout) => {
                 conn.on_timeout();
+                last_timer_run = Instant::now();
             }
 
             // Continue a capped internal batch without waiting for a new
@@ -1288,6 +1308,10 @@ where
                 send_batch.push(&paced_buf[..len], send_info.to);
             }
         }
+
+        // Under load another branch always wins before the sleep above ends,
+        // so a timer that has already expired runs here instead.
+        run_expired_timers(&mut conn, &mut last_timer_run);
 
         // Drain any additional ready TUN packets up to MAX_FORWARDING_BATCH so
         // an upload burst is queued into quiche and sent in one UDP batch.
@@ -1630,6 +1654,30 @@ mod tests {
     }
 
     #[test]
+    fn handshake_loops_never_sleep_for_zero_or_past_their_deadline() {
+        let plenty = Duration::from_secs(15);
+        assert_eq!(
+            handshake_loop_timeout(Some(Duration::ZERO), plenty),
+            MIN_EVENT_LOOP_SLEEP
+        );
+        assert_eq!(
+            handshake_loop_timeout(Some(Duration::from_millis(40)), plenty),
+            Duration::from_millis(40)
+        );
+        assert_eq!(
+            handshake_loop_timeout(None, plenty),
+            Duration::from_millis(100)
+        );
+        // The deadline wins over the floor, so the loop ends on time.
+        let nearly_over = Duration::from_millis(2);
+        assert_eq!(
+            handshake_loop_timeout(Some(Duration::ZERO), nearly_over),
+            nearly_over
+        );
+        assert_eq!(handshake_loop_timeout(None, nearly_over), nearly_over);
+    }
+
+    #[test]
     fn forwarding_batch_only_schedules_continuation_at_its_limit() {
         assert!(!forwarding_batch_limit_reached(0));
         assert!(!forwarding_batch_limit_reached(MAX_FORWARDING_BATCH - 2));
@@ -1903,6 +1951,11 @@ mod tests {
     /// A client and a server that completed their handshake in memory, both
     /// with datagrams on. The server's certificate is a throwaway.
     fn connected_pair() -> (quiche::Connection, quiche::Connection) {
+        connected_pair_with_idle_timeout(0)
+    }
+
+    /// The same, with a max idle timeout in milliseconds (0: none).
+    fn connected_pair_with_idle_timeout(idle_ms: u64) -> (quiche::Connection, quiche::Connection) {
         use std::io::Write;
 
         let config = |server: bool| {
@@ -1910,6 +1963,7 @@ mod tests {
             config.set_application_protos(&[b"test"]).expect("alpn");
             config.verify_peer(false);
             config.enable_dgram(true, 1000, 1000);
+            config.set_max_idle_timeout(idle_ms);
             if server {
                 let key_pair = rcgen::KeyPair::generate().expect("test key");
                 let cert = rcgen::CertificateParams::new(Vec::<String>::new())
@@ -2044,6 +2098,35 @@ mod tests {
             Duration::from_secs(90)
         );
         assert!(idle_timeout(Duration::from_secs(1)) > Duration::from_secs(2));
+    }
+
+    #[test]
+    fn an_expired_timer_runs_between_events_at_most_once_per_floor() {
+        let floor = MIN_EVENT_LOOP_SLEEP;
+        assert!(expired_timer_due(Some(Duration::ZERO), floor));
+        // Just run: wait, or a timer quiche leaves expired would spin the loop.
+        assert!(!expired_timer_due(Some(Duration::ZERO), floor / 2));
+        // Not expired yet, or no timer armed: the sleep branch handles those.
+        assert!(!expired_timer_due(Some(Duration::from_millis(1)), floor));
+        assert!(!expired_timer_due(None, floor));
+    }
+
+    #[test]
+    fn a_dead_peer_is_noticed_without_a_quiet_event_loop() {
+        // The sleep branch needs 5 ms with no TUN or UDP event, which a busy
+        // tunnel never has; only on_timeout applies quiche's idle timeout.
+        let (mut client, _server) = connected_pair_with_idle_timeout(50);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(client.timeout(), Some(Duration::ZERO));
+        assert!(!client.is_closed());
+
+        let mut last_run = Instant::now();
+        run_expired_timers(&mut client, &mut last_run);
+        assert!(!client.is_closed(), "ran again within the floor period");
+
+        std::thread::sleep(MIN_EVENT_LOOP_SLEEP);
+        run_expired_timers(&mut client, &mut last_run);
+        assert!(client.is_timed_out());
     }
 
     #[test]
