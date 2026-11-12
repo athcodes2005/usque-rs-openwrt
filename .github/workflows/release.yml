@@ -11,8 +11,9 @@ on:
         required: true
         default: "v0.2.0"
 
+# Only the build job publishes; it asks for write access itself.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -68,6 +69,8 @@ jobs:
     name: Build / ${{ matrix.target }}
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     strategy:
       fail-fast: false
@@ -118,7 +121,7 @@ jobs:
       - name: Build (release)
         env:
           CARGO_PROFILE_RELEASE_PANIC: ${{ matrix.panic_strategy || 'abort' }}
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Strip binary
         run: |

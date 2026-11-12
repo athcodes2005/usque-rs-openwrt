@@ -41,6 +41,15 @@ Append new entries at the end.
 
 - Added `nativetun --udp-recv-buffer <BYTES>` (default 4 MiB, `0` = kernel default), applied per session on Linux via `SO_RCVBUFFORCE` with an `SO_RCVBUF` fallback; effective size logged once per process. Live A/B: `RcvbufErrors` thousands to 0, download ping loss 10–23% to 0–8%. See [[systems/udp-receive-buffer]]. Version bumped to 0.2.2.
 
+## 2026-11-12 — QUIC timer fixes (v0.2.3)
+
+- The 5 ms timer floor starved `on_timeout()` while the tunnel was busy; the
+  session loop now runs an expired timer after each `select!`, at most once per
+  5 ms. The handshake and CONNECT-wait loops got the same floor, and the CONNECT
+  wait lost its 100-pass cap. See [[bugs/quic-timer-floor]].
+- `release.yml`: only the build job holds `contents: write`, and the cross build
+  uses `--locked`. Version bumped to 0.2.3 (106 unit + 4 integration tests).
+
 ## Sources
 
 - `../../src/`, `../../tests/tunnel_mtu.rs`
