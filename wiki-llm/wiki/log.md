@@ -50,6 +50,23 @@ Append new entries at the end.
 - `release.yml`: only the build job holds `contents: write`, and the cross build
   uses `--locked`. Version bumped to 0.2.3 (106 unit + 4 integration tests).
 
+## 2026-11-12 — Dependency refresh and release pipeline hardening (0.2.4)
+
+- `cargo update`: 137 semver-compatible updates (tokio 1.54, rustls 0.23.46,
+  libc 0.2.191, among others). Left at their current major versions, each
+  needing code changes and a tunnel A/B test: quiche 0.22 (0.30 is out), tun,
+  rtnetlink, netlink-packet-route, reqwest, rcgen, x509-parser and the
+  RustCrypto crates (p256, der, pkcs8, sec1, pem), base64, rand.
+- A UDP send error no longer ends the batch: `sendmmsg` falling over hands the
+  batch to the per-packet path, where a failure costs that one packet (C6).
+- `rust-version = "1.88"` replaces the unverified 1.75 in `clippy.toml` (C5);
+  the lints that exposed are fixed.
+- `release.yml`: one `publish` job (C2), the unused bare-binary copy removed
+  (C3), manual runs build the tag they name (C12), actions pinned by commit at
+  current versions (checkout v7, action-gh-release v3). `Cross.toml` verifies
+  the Go download (C4). See [[operations/build-and-release]]. 107 unit + 4
+  integration tests on macOS; the reworked workflow has not run yet.
+
 ## Sources
 
 - `../../src/`, `../../tests/tunnel_mtu.rs`

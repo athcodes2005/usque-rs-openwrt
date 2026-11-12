@@ -7,11 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create/update (e.g. v0.2.0)"
+        description: "Existing release tag to build and publish again (e.g. v0.2.4)"
         required: true
-        default: "v0.2.0"
 
-# Only the build job publishes; it asks for write access itself.
+# Only the publish job writes; it asks for that itself.
 permissions:
   contents: read
 
@@ -19,17 +18,22 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CROSS_CONFIG: Cross.toml
+  # A manual run builds the tag it names, not the branch it was started from.
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
+# Third-party actions are pinned by commit: a tag can be moved to other code,
+# and the publish job below holds write access to the releases the router
+# installs from.
 jobs:
   test:
     name: Test and verify tag
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Verify tag matches Cargo.toml version
-        env:
-          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           CARGO_VERSION="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version[[:space:]]*=/{gsub(/[" ]/,"",$0); sub(/^version=/,"",$0); print; exit}' Cargo.toml)"
           if [[ -z "$CARGO_VERSION" ]]; then
@@ -49,12 +53,13 @@ jobs:
             pkg-config clang libclang-dev nasm
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: stable
           components: clippy
 
       - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           prefix-key: v2-portable
           shared-key: release-test
@@ -69,8 +74,6 @@ jobs:
     name: Build / ${{ matrix.target }}
     needs: test
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     strategy:
       fail-fast: false
@@ -101,20 +104,22 @@ jobs:
             panic_strategy: unwind
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ matrix.toolchain || 'stable' }}
 
       - name: Cache Rust registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: release-${{ matrix.target }}
 
       - name: Install cross
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cross
 
@@ -137,32 +142,51 @@ jobs:
             fi
           fi
 
-      - name: Package archive and stable binary asset
-        id: pkg
+      # The versioned archive, and a copy under a name that stays the same
+      # from release to release (the one router-script downloads).
+      - name: Package archives
         run: |
-          ARCHIVE="${{ matrix.artifact_name }}-${{ github.ref_name }}.tar.gz"
+          mkdir dist
+          ARCHIVE="${{ matrix.artifact_name }}-${RELEASE_TAG}.tar.gz"
           STABLE_ARCHIVE="${{ matrix.artifact_name }}.tar.gz"
-          tar czf "$ARCHIVE" \
+          tar czf "dist/$ARCHIVE" \
             -C target/${{ matrix.target }}/release \
             usque-rs
-          cp "$ARCHIVE" "$STABLE_ARCHIVE"
+          cp "dist/$ARCHIVE" "dist/$STABLE_ARCHIVE"
+          cd dist
           sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
           sha256sum "$STABLE_ARCHIVE" > "${STABLE_ARCHIVE}.sha256"
-          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
-            cp target/${{ matrix.target }}/release/usque-rs usque-rs-aarch64-linux-musl
-            sha256sum usque-rs-aarch64-linux-musl > usque-rs-aarch64-linux-musl.sha256
-          fi
-          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
-          echo "stable_archive=$STABLE_ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Hand the archives to the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 3
+
+  # One job creates the release and uploads every target. Six build jobs each
+  # creating or updating it at once could race, and each held write access.
+  # It runs when a target failed too, with what was built: one broken target
+  # (mipsel builds on nightly) must not keep the others from being released.
+  publish:
+    name: Publish release
+    needs: [test, build]
+    if: ${{ !cancelled() && needs.test.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Collect the built archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: |
-            ${{ steps.pkg.outputs.archive }}
-            ${{ steps.pkg.outputs.archive }}.sha256
-            ${{ steps.pkg.outputs.stable_archive }}
-            ${{ steps.pkg.outputs.stable_archive }}.sha256
-          generate_release_notes: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: dist/*
+          generate_release_notes: true
           fail_on_unmatched_files: true

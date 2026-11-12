@@ -1,5 +1,6 @@
 # Go is downloaded from upstream rather than apt - distro packages may be too
-# old for BoringSSL's generate_build_files.go.
+# old for BoringSSL's generate_build_files.go. The download is checked against
+# the sha256 that dl.google.com publishes for this version; change both together.
 
 [build.env]
 passthrough = [
@@ -11,7 +12,9 @@ passthrough = [
 pre-build = [
     "apt-get update -qq",
     "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build perl pkg-config clang libclang-dev nasm curl ca-certificates xz-utils",
-    "curl -sSfL https://go.dev/dl/go1.22.10.linux-amd64.tar.gz | tar -xzf - -C /usr/local",
+    "curl -sSfL -o /tmp/go.tar.gz https://go.dev/dl/go1.22.10.linux-amd64.tar.gz",
+    "echo '736ce492a19d756a92719a6121226087ccd91b652ed5caec40ad6dbfb2252092  /tmp/go.tar.gz' | sha256sum -c -",
+    "tar -xzf /tmp/go.tar.gz -C /usr/local && rm /tmp/go.tar.gz",
     "ln -sf /usr/local/go/bin/go /usr/local/bin/go",
 ]
 

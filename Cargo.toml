@@ -1,7 +1,10 @@
 [package]
 name = "usque-rs"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
+# The newest toolchain a locked dependency needs (`time` 0.3.55); clippy reads
+# its MSRV from here too.
+rust-version = "1.88"
 description = "OpenWrt-optimized Rust MASQUE (CONNECT-IP over HTTP/3 & QUIC) client for Cloudflare WARP"
 repository = "https://github.com/athcodes2005/usque-rs-openwrt"
 homepage = "https://github.com/athcodes2005/usque-rs-openwrt"

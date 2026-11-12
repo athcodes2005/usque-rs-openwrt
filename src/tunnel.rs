@@ -216,9 +216,9 @@ impl UploadQueue {
     fn report(&mut self, now: Instant) -> Option<String> {
         let span = now.saturating_duration_since(self.unreported_since?);
         let stopped = now.saturating_duration_since(self.last_drop) >= UPLOAD_DROP_QUIET;
-        let spaced = self.last_report.map_or(true, |at| {
-            now.saturating_duration_since(at) >= UPLOAD_DROP_REPORT_PERIOD
-        });
+        let spaced = self
+            .last_report
+            .is_none_or(|at| now.saturating_duration_since(at) >= UPLOAD_DROP_REPORT_PERIOD);
         if !(spaced && (stopped || span >= UPLOAD_DROP_REPORT_PERIOD)) {
             return None;
         }
@@ -362,7 +362,7 @@ fn pacing_delay(send_at: Instant, now: Instant) -> Duration {
     }
 }
 
-fn noop_waker() -> std::task::Waker {
+const fn noop_waker() -> std::task::Waker {
     const VTABLE: std::task::RawWakerVTable =
         std::task::RawWakerVTable::new(|_| RAW, |_| {}, |_| {}, |_| {});
     const RAW: std::task::RawWaker = std::task::RawWaker::new(std::ptr::null(), &VTABLE);
@@ -429,8 +429,11 @@ fn send_batch_mmsg(
 
 /// Pre-allocated batch of outbound QUIC UDP datagrams (`[I3]`).
 /// On Linux (`target_os = "linux"`), flushes a multi-packet batch in a single
-/// `sendmmsg(2)` syscall, falling back to per-packet async sends only when the
-/// kernel socket buffer partially fills (`EAGAIN`).
+/// `sendmmsg(2)` syscall, falling back to per-packet async sends for whatever
+/// it did not take: the rest after a partial send, or the whole batch after an
+/// error. An error belongs to one send, often to an earlier packet (an ICMP
+/// "unreachable" is reported on the next call), so it costs at most that one
+/// packet and never the rest of the batch.
 struct UdpSendBatch {
     peer: SocketAddr,
     buffers: Vec<[u8; MAX_DATAGRAM_SIZE]>,
@@ -458,7 +461,7 @@ impl UdpSendBatch {
         &mut self.buffers[self.count]
     }
 
-    fn commit(&mut self, len: usize, to: SocketAddr) {
+    const fn commit(&mut self, len: usize, to: SocketAddr) {
         self.lengths[self.count] = len;
         self.dests[self.count] = to;
         self.count += 1;
@@ -485,10 +488,8 @@ impl UdpSendBatch {
                     start = sent;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => {
-                    log::warn!("UDP batch send error: {error}");
-                    return;
-                }
+                // Nothing was sent; reading the error cleared it.
+                Err(error) => log::warn!("UDP batch send error: {error}"),
             }
         }
 
@@ -502,7 +503,6 @@ impl UdpSendBatch {
             };
             if let Err(error) = res {
                 log::warn!("UDP send error: {error}");
-                break;
             }
         }
     }
@@ -2566,6 +2566,37 @@ mod tests {
         let mut invalid = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
         assert!(!restore_quic_session(&mut client, &mut invalid));
         assert!(invalid.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_udp_send_error_costs_one_packet_not_the_rest_of_the_batch() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = receiver.local_addr().unwrap();
+        let other = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let elsewhere = other.local_addr().unwrap();
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.connect(peer).await.unwrap();
+
+        // The first datagram names another destination on a connected socket.
+        // Where that is an error (EISCONN on the BSDs; Linux just sends it),
+        // the batch used to end there and lose the two packets behind it.
+        let mut batch = UdpSendBatch::new(peer);
+        batch.push(&[9], elsewhere);
+        batch.push(&[1], peer);
+        batch.push(&[2], peer);
+        batch.flush(&sender).await;
+
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 8];
+        for _ in 0..2 {
+            let len = tokio::time::timeout(Duration::from_secs(5), receiver.recv(&mut buf))
+                .await
+                .expect("the packets behind the failed one")
+                .unwrap();
+            assert_eq!(len, 1);
+            seen.push(buf[0]);
+        }
+        assert_eq!(seen, [1, 2]);
     }
 
     #[tokio::test]
