@@ -405,7 +405,7 @@ fn send_batch_mmsg(
             iov_base: buffers[i].as_ptr().cast_mut().cast(),
             iov_len: lengths[i],
         };
-        hdrs[i].msg_hdr.msg_iov = std::ptr::addr_of_mut!(iovecs[i]);
+        hdrs[i].msg_hdr.msg_iov = &raw mut iovecs[i];
         hdrs[i].msg_hdr.msg_iovlen = 1;
     }
 
@@ -620,8 +620,8 @@ fn recv_buffer_size(fd: std::os::fd::RawFd) -> std::io::Result<usize> {
             fd,
             libc::SOL_SOCKET,
             libc::SO_RCVBUF,
-            std::ptr::addr_of_mut!(value).cast(),
-            &mut len,
+            (&raw mut value).cast(),
+            &raw mut len,
         )
     };
     if rc < 0 {
@@ -642,7 +642,7 @@ fn setsockopt_rcvbuf(
             fd,
             libc::SOL_SOCKET,
             option,
-            std::ptr::addr_of!(bytes).cast(),
+            (&raw const bytes).cast(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
     };
