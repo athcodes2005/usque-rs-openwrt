@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use p256::ecdsa::SigningKey;
+use p256::elliptic_curve::Generate;
 use p256::pkcs8::EncodePrivateKey;
 use ring::rand::SecureRandom;
 use serde::{Deserialize, Serialize};
@@ -171,13 +172,14 @@ pub async fn register(model: &str, locale: &str, jwt: Option<&str>) -> Result<Ac
 }
 
 pub fn generate_ec_keypair() -> Result<(Vec<u8>, Vec<u8>)> {
-    let signing_key = SigningKey::random(&mut rand::thread_rng());
+    let signing_key =
+        SigningKey::try_generate().map_err(|e| anyhow::anyhow!("RNG failure: {e}"))?;
 
     let priv_key_der = signing_key
         .to_pkcs8_der()
         .context("failed to encode private key to DER")?;
 
-    let pub_key_der = signing_key.verifying_key().to_encoded_point(false);
+    let pub_key_der = signing_key.verifying_key().to_sec1_point(false);
     let pub_key_bytes = pub_key_der.as_bytes();
 
     let spki = der::asn1::ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
@@ -237,4 +239,38 @@ pub async fn enroll_key(
     resp.json::<AccountData>()
         .await
         .context("failed to parse enrollment response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
+
+    // The API takes the public key as a DER SubjectPublicKeyInfo: this fixed
+    // header for an uncompressed P-256 point, then the 65-byte point.
+    const P256_SPKI_HEADER: [u8; 26] = [
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
+        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+    ];
+
+    #[test]
+    fn a_generated_keypair_is_a_pkcs8_key_and_its_spki() {
+        let (priv_key_der, pub_key_der) = generate_ec_keypair().expect("keypair");
+        let signing_key = SigningKey::from_pkcs8_der(&priv_key_der).expect("PKCS#8 private key");
+        assert_eq!(pub_key_der.len(), 91);
+        assert_eq!(pub_key_der[..26], P256_SPKI_HEADER);
+        assert_eq!(pub_key_der[26], 0x04, "uncompressed point");
+        let expected = signing_key
+            .verifying_key()
+            .to_public_key_der()
+            .expect("SPKI");
+        assert_eq!(pub_key_der, expected.as_bytes());
+    }
+
+    #[test]
+    fn each_generated_keypair_is_new() {
+        let (first, _) = generate_ec_keypair().expect("keypair");
+        let (second, _) = generate_ec_keypair().expect("keypair");
+        assert_ne!(first, second);
+    }
 }
