@@ -103,3 +103,70 @@ pub async fn configure_tun(cfg: &TunConfig, dev: &tun::Device) -> Result<()> {
 pub async fn configure_tun(_cfg: &TunConfig, _dev: &tun::Device) -> Result<()> {
     anyhow::bail!("netlink TUN configuration is only supported on Linux; pass --no-iproute2")
 }
+
+// The one place the device is created and then configured over netlink as on
+// the router, which starts the client without --no-iproute2. Needs root and
+// /dev/net/tun; skipped otherwise.
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::net::UdpSocket;
+
+    fn sysfs(name: &str, file: &str) -> String {
+        std::fs::read_to_string(format!("/sys/class/net/{name}/{file}"))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn the_device_gets_its_mtu_addresses_and_link_up_over_netlink() {
+        let name = format!("usqn{}", std::process::id() % 100_000);
+        let cfg = TunConfig {
+            name: Some(name.clone()),
+            mtu: 1280,
+            ipv4: Some("172.31.254.2".to_string()),
+            ipv6: Some("fd00:7573:7175::2".to_string()),
+            setup_addresses: true,
+        };
+        let dev = match create_tun(&cfg) {
+            Ok(dev) => dev,
+            Err(error) => {
+                eprintln!("Skipping TUN test (no permission): {error:#}");
+                return;
+            }
+        };
+        assert_eq!(dev.tun_name().expect("name"), name);
+        assert!(
+            UdpSocket::bind("172.31.254.2:0").is_err(),
+            "the test address is already in use on this host"
+        );
+
+        configure_tun(&cfg, &dev).await.expect("configure");
+
+        assert_eq!(sysfs(&name, "mtu"), "1280");
+        let flags = sysfs(&name, "flags");
+        let flags = u32::from_str_radix(flags.trim_start_matches("0x"), 16).expect("flags");
+        assert_eq!(flags & 1, 1, "IFF_UP");
+
+        // Only a local address can be bound.
+        UdpSocket::bind("172.31.254.2:0").expect("IPv4 address is assigned");
+        // A /32 adds no subnet route for the device.
+        let routes = std::fs::read_to_string("/proc/net/route").expect("routes");
+        assert!(
+            !routes.lines().any(|line| line.starts_with(&name)),
+            "{routes}"
+        );
+
+        // address, ifindex, prefix length (hex), scope, flags, name
+        let inet6 = std::fs::read_to_string("/proc/net/if_inet6").expect("if_inet6");
+        let ours: Vec<&str> = inet6
+            .lines()
+            .find(|line| line.starts_with("fd007573717500000000000000000002"))
+            .expect("IPv6 address is assigned")
+            .split_whitespace()
+            .collect();
+        assert_eq!(ours[2], "80", "prefix length 128");
+        assert_eq!(ours[5], name);
+    }
+}
