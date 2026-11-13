@@ -45,7 +45,7 @@ x509-parser = "0.18"
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem"] }
 der = { version = "0.8", features = ["pem"] }
 pkcs8 = { version = "0.11", features = ["pem", "std"] }
-tun = { version = "0.7", features = ["async"] }
+tun = { version = "0.8", features = ["async"] }
 tempfile = "3"
 time = "0.3"
 # Software fallback for 64-bit atomics on targets without native support (e.g. armv5te)
@@ -53,8 +53,7 @@ portable-atomic = { version = "1", features = ["fallback"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-rtnetlink = "0.14"
-netlink-packet-route = "0.21"
+rtnetlink = "0.24"
 futures = "0.3"
 
 [profile.release]
