@@ -113,6 +113,21 @@ fn cf_time_string() -> String {
         .to_string()
 }
 
+/// TLS for the API calls: ring and the Mozilla roots built into the binary,
+/// which is what reqwest 0.12's `rustls-tls` gave. reqwest 0.13's own choice
+/// is aws-lc-rs with the system's certificate store, and a router may have no
+/// CA bundle installed.
+fn api_tls_config() -> Result<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("failed to select TLS versions")?
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 fn build_client() -> Result<reqwest::Client> {
     use reqwest::header::{HeaderMap, HeaderValue};
     let mut headers = HeaderMap::new();
@@ -128,6 +143,7 @@ fn build_client() -> Result<reqwest::Client> {
     headers.insert("Connection", HeaderValue::from_static("Keep-Alive"));
 
     reqwest::Client::builder()
+        .tls_backend_preconfigured(api_tls_config()?)
         .default_headers(headers)
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
@@ -265,6 +281,26 @@ mod tests {
             .to_public_key_der()
             .expect("SPKI");
         assert_eq!(pub_key_der, expected.as_bytes());
+    }
+
+    // reqwest takes the rustls config as `Any` and only finds out in `build`
+    // whether it is the rustls version it was compiled against.
+    #[test]
+    fn the_api_client_accepts_our_tls_config() {
+        build_client().expect("client");
+    }
+
+    // Needs the network: `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "connects to the WARP API"]
+    async fn the_api_host_certificate_verifies_against_the_built_in_roots() {
+        let response = build_client()
+            .expect("client")
+            .get(format!("{API_URL}/{API_VERSION}/reg"))
+            .send()
+            .await
+            .expect("TLS handshake and HTTP exchange");
+        assert!(response.status().as_u16() >= 200);
     }
 
     #[test]
