@@ -40,11 +40,19 @@ const MIN_EVENT_LOOP_SLEEP: Duration = Duration::from_millis(5);
 // an unbounded UDP drain can remain readable indefinitely during a download,
 // starving decoded datagrams, TUN writes, and QUIC ACK transmission.
 const MAX_FORWARDING_BATCH: usize = 64;
-// Tokio's timer wheel ticks at 1 ms resolution. Sub-millisecond pacing gaps
-// (< 500 µs, which occur whenever quiche paces above ~21 Mbit/s) cannot be
-// slept on accurately in user space without stalling the send loop for a full
-// >= 1 ms timer tick per packet; coalesce them into the current send batch.
-const PACING_COALESCE_WINDOW: Duration = Duration::from_micros(500);
+// How far ahead of quiche's pacing schedule a packet may leave. quiche's BBR2
+// pacer makes each packet due one interval after the later of its schedule and
+// the moment the previous packet was generated, so a sender that comes back
+// late from a timer starts the schedule again from there and never makes up
+// the time it overslept. Tokio's timer wheel ticks in whole milliseconds, and
+// the loop may be busy when a timer fires: waiting for each packet's own
+// deadline oversleeps every time, and the rate BBR2 then measures and paces at
+// shrinks until the gaps dwarf the oversleeping (about 3 Mbit/s of upload on a
+// path that carries 60). Released this much early, with the wait that much
+// shorter, a packet is still inside the schedule after a late wake-up. It also
+// spares a timer per packet: at pacing gaps under a millisecond, everything
+// due within the lead goes into the current send batch.
+const PACING_LEAD: Duration = Duration::from_millis(3);
 // A failed TUN write loses that one packet. Writes that keep failing mean the
 // device is gone, so the session ends instead of silently dropping all traffic.
 const MAX_CONSECUTIVE_TUN_WRITE_FAILURES: u32 = 32;
@@ -353,13 +361,12 @@ const fn forwarding_batch_limit_reached(index: usize) -> bool {
     index + 1 == MAX_FORWARDING_BATCH
 }
 
+/// How long to hold a packet quiche wants sent at `send_at`: until it is
+/// within `PACING_LEAD` of that time.
 fn pacing_delay(send_at: Instant, now: Instant) -> Duration {
-    let delay = send_at.saturating_duration_since(now);
-    if delay < PACING_COALESCE_WINDOW {
-        Duration::ZERO
-    } else {
-        delay
-    }
+    send_at
+        .saturating_duration_since(now)
+        .saturating_sub(PACING_LEAD)
 }
 
 const fn noop_waker() -> std::task::Waker {
@@ -554,7 +561,7 @@ where
             dgram.extend_from_slice(pkt);
 
             let dgram_len = dgram.len();
-            match conn.dgram_send_vec(dgram) {
+            match conn.dgram_send_buf(dgram) {
                 Ok(()) => {
                     stats.tx_packets.fetch_add(1, Ordering::Relaxed);
                     stats.tx_bytes.fetch_add(pkt_len, Ordering::Relaxed);
@@ -846,17 +853,13 @@ fn configure_quic(
     quic_config.set_max_idle_timeout(u64::try_from(idle.as_millis()).unwrap_or(u64::MAX));
     quic_config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     quic_config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
-    // Keep quiche's internal DPLPMTUD disabled on quiche 0.22.0 clients: in
-    // quiche 0.22.0 (`src/path.rs:339`), `should_send_pmtu_probe` checks
-    // `hs_confirmed && hs_done` (`self.handshake_done_sent`), which is only
-    // ever true on a server. Enabling `discover_pmtu(true)` on a client sets
-    // `dgram_max_writable_len()` to 1,322 bytes in `send()` (`src/lib.rs:3384`,
-    // which uses `||`) while `send_single()` (`src/lib.rs:3608`) stays clamped
-    // at `pmtud.get_current() == 1200`, wedging `dgram_send_queue` on the first
-    // packet > 1,157 bytes. With `discover_pmtu(false)` and the 1,350-byte UDP
-    // payload limit, quiche negotiates a 1,322-byte writable datagram payload
-    // (~1,320-byte IP MTU) and `effective_datagram_ip_mtu` advertises that
-    // exact ceiling via ICMP PMTUD.
+    // quiche's own DPLPMTUD stays off. With it on, a connection starts at
+    // 1,200 bytes and probes upward; off, it sends up to the 1,350-byte UDP
+    // payload set above from the first packet, and there is nothing larger
+    // for a probe to find. That gives a 1,322-byte writable datagram payload
+    // (~1,320-byte IP MTU), the ceiling `effective_datagram_ip_mtu` advertises
+    // via ICMP PMTUD. (quiche 0.22 could not probe as a client at all and
+    // wedged its datagram queue when asked to; 0.30 can.)
     quic_config.discover_pmtu(false);
     quic_config.enable_early_data();
     quic_config.set_initial_max_data(10_000_000);
@@ -1123,7 +1126,7 @@ where
 
         loop {
             match h3_conn.poll(&mut conn) {
-                Ok((sid, quiche::h3::Event::Headers { list, has_body: _ })) if sid == stream_id => {
+                Ok((sid, quiche::h3::Event::Headers { list, .. })) if sid == stream_id => {
                     for h in &list {
                         if h.name() == b":status" {
                             let status = std::str::from_utf8(h.value()).unwrap_or("?");
@@ -1422,12 +1425,21 @@ where
             drop_stale_uploads(queue, &mut conn, &stats);
         }
 
-        // Collect all immediately-due QUIC packets into send_batch and flush
-        // them in one batched syscall (sendmmsg on Linux). If quiche schedules
-        // a packet >= PACING_COALESCE_WINDOW in the future, retain it in the
-        // pre-allocated paced_buf and resume when its pacing timer fires.
+        // A held packet leaves as soon as it is due, whichever branch woke the
+        // loop. Its timer branch has to win the select against TUN and UDP
+        // reads that are ready too, and every turn it loses makes it later.
+        let now = Instant::now();
+        if let Some((len, send_info)) =
+            paced_packet.take_if(|(_, info)| pacing_delay(info.at, now).is_zero())
+        {
+            send_batch.push(&paced_buf[..len], send_info.to);
+        }
+
+        // Collect all due QUIC packets into send_batch and flush them in one
+        // batched syscall (sendmmsg on Linux). If quiche schedules a packet
+        // more than PACING_LEAD in the future, retain it in the pre-allocated
+        // paced_buf and resume when it comes due.
         if paced_packet.is_none() {
-            let now = Instant::now();
             while !send_batch.is_full() {
                 match conn.send(send_batch.next_buf_mut()) {
                     Ok((write, send_info)) => {
@@ -2252,31 +2264,107 @@ mod tests {
     }
 
     #[test]
-    fn pacing_delay_waits_for_future_packets_without_rewaiting_past_packets() {
+    fn pacing_delay_waits_until_a_packet_is_within_the_lead_of_its_send_time() {
         let now = Instant::now();
         assert_eq!(pacing_delay(now, now), Duration::ZERO);
-        // Sub-millisecond pacing deadlines (< PACING_COALESCE_WINDOW = 500 µs)
-        // coalesce into the current send batch instead of sleeping on Tokio's
-        // 1 ms timer wheel.
+        assert_eq!(pacing_delay(now + PACING_LEAD, now), Duration::ZERO);
         assert_eq!(
-            pacing_delay(now + Duration::from_micros(250), now),
-            Duration::ZERO
-        );
-        assert_eq!(
-            pacing_delay(now + Duration::from_micros(499), now),
-            Duration::ZERO
-        );
-        assert_eq!(
-            pacing_delay(now + Duration::from_micros(500), now),
-            Duration::from_micros(500)
+            pacing_delay(now + PACING_LEAD + Duration::from_micros(200), now),
+            Duration::from_micros(200)
         );
         assert_eq!(
             pacing_delay(now + Duration::from_millis(25), now),
-            Duration::from_millis(25)
+            Duration::from_millis(25).saturating_sub(PACING_LEAD)
         );
         // Avoid Instant::checked_sub on fresh CI VMs with small monotonic uptime.
         let later = now + Duration::from_millis(25);
         assert_eq!(pacing_delay(now, later), Duration::ZERO);
+    }
+
+    /// quiche's BBR2 pacer in miniature (`recovery/gcongestion/pacer.rs`, once
+    /// its unpaced first burst is spent): a packet is due at the later of the
+    /// schedule and now, and the schedule then moves one interval past that.
+    struct PacerModel {
+        next: Instant,
+        interval: Duration,
+    }
+
+    impl PacerModel {
+        fn generate(&mut self, now: Instant) -> Instant {
+            let send_at = self.next.max(now);
+            self.next = send_at + self.interval;
+            send_at
+        }
+    }
+
+    /// Packets sent in `span` by the session loop's rule (send what is due,
+    /// hold the first that is not, sleep `delay_for` it) when every sleep ends
+    /// `oversleep` late.
+    fn packets_sent_through_a_coarse_timer(
+        interval: Duration,
+        oversleep: Duration,
+        span: Duration,
+        delay_for: impl Fn(Instant, Instant) -> Duration,
+    ) -> u32 {
+        let start = Instant::now();
+        let mut now = start;
+        let mut pacer = PacerModel {
+            next: start,
+            interval,
+        };
+        let mut sent = 0;
+        while now < start + span {
+            loop {
+                let send_at = pacer.generate(now);
+                sent += 1;
+                let delay = delay_for(send_at, now);
+                if !delay.is_zero() {
+                    now += delay + oversleep;
+                    break;
+                }
+            }
+        }
+        sent
+    }
+
+    // Timers on the router fire a millisecond or two late. Sleeping until each
+    // packet's own send time lost that much of quiche's schedule every time.
+    #[test]
+    fn late_timers_do_not_cost_any_of_the_pacing_rate() {
+        let span = Duration::from_secs(1);
+        let oversleep = Duration::from_micros(1_500);
+        // 1,350-byte packets at 60 and at 5 Mbit/s.
+        for interval in [Duration::from_micros(180), Duration::from_micros(2_160)] {
+            let scheduled = u32::try_from(span.as_micros() / interval.as_micros()).unwrap();
+            let sent = packets_sent_through_a_coarse_timer(interval, oversleep, span, pacing_delay);
+            assert!(
+                sent >= scheduled && sent <= scheduled + scheduled / 50 + 20,
+                "sent {sent} of {scheduled} at {interval:?}"
+            );
+        }
+        // Without the lead, gaps shorter than the oversleeping lose most of the rate.
+        let interval = Duration::from_micros(180);
+        let scheduled = u32::try_from(span.as_micros() / interval.as_micros()).unwrap();
+        let waited_out =
+            packets_sent_through_a_coarse_timer(interval, oversleep, span, |at, now| {
+                at.saturating_duration_since(now)
+            });
+        assert!(
+            waited_out < scheduled * 2 / 3,
+            "{waited_out} of {scheduled}"
+        );
+    }
+
+    // A timer that oversleeps by more than the lead still loses only the excess.
+    #[test]
+    fn a_timer_later_than_the_lead_loses_only_what_exceeds_it() {
+        let span = Duration::from_secs(1);
+        let interval = Duration::from_micros(180);
+        let oversleep = PACING_LEAD + Duration::from_millis(1);
+        let scheduled = u32::try_from(span.as_micros() / interval.as_micros()).unwrap();
+        let sent = packets_sent_through_a_coarse_timer(interval, oversleep, span, pacing_delay);
+        assert!(sent < scheduled, "sent {sent} of {scheduled}");
+        assert!(sent > scheduled * 2 / 3, "sent {sent} of {scheduled}");
     }
 
     // ---- WARP audit optimizations: I1 (asymmetric dgram queues), I4 (PMTUD), I2 (0-RTT) ----

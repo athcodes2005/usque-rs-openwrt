@@ -17,7 +17,7 @@ name = "usque-rs"
 path = "src/main.rs"
 
 [dependencies]
-quiche = { version = "0.22", features = ["boringssl-vendored"] }
+quiche = "0.30"
 octets = "0.3"
 
 tokio = { version = "1", features = ["io-util", "net", "macros", "rt-multi-thread", "time"] }
