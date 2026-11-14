@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - "v*.*.*"
+    # A change to the dependencies or to the build setup is cross-built for
+    # every target when it reaches main, without publishing anything: a target
+    # that no longer builds then shows before a tag is cut. (Tag pushes ignore
+    # the path filter.)
+    branches:
+      - main
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - Cross.toml
+      - .github/workflows/release.yml
   workflow_dispatch:
     inputs:
       tag:
@@ -20,6 +31,10 @@ env:
   CROSS_CONFIG: Cross.toml
   # A manual run builds the tag it names, not the branch it was started from.
   RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  # What to check out: that tag, or the commit that was pushed.
+  BUILD_REF: ${{ github.event.inputs.tag || github.sha }}
+  # Only a tag (pushed, or named in a manual run) is published.
+  PUBLISH: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
 
 # Third-party actions are pinned by commit: a tag can be moved to other code,
 # and the publish job below holds write access to the releases the router
@@ -31,9 +46,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.BUILD_REF }}
 
       - name: Verify tag matches Cargo.toml version
+        if: env.PUBLISH == 'true'
         run: |
           CARGO_VERSION="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version[[:space:]]*=/{gsub(/[" ]/,"",$0); sub(/^version=/,"",$0); print; exit}' Cargo.toml)"
           if [[ -z "$CARGO_VERSION" ]]; then
@@ -49,7 +65,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build golang-go perl \
+            cmake ninja-build perl \
             pkg-config clang libclang-dev nasm
 
       - name: Install Rust stable
@@ -106,7 +122,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.BUILD_REF }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -172,7 +188,7 @@ jobs:
   publish:
     name: Publish release
     needs: [test, build]
-    if: ${{ !cancelled() && needs.test.result == 'success' }}
+    if: ${{ !cancelled() && needs.test.result == 'success' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

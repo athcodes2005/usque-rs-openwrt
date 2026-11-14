@@ -1,6 +1,6 @@
 [package]
 name = "usque-rs"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2021"
 # The newest toolchain a locked dependency needs (`time` 0.3.55); clippy reads
 # its MSRV from here too.

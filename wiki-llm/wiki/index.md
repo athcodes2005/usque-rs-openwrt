@@ -24,6 +24,7 @@ the Rust module layout and QUIC/MASQUE session lifecycle.
 ## Bugs and performance fixes
 
 - [[bugs/quic-timer-floor]] — 5 ms floor on expired quiche timers to prevent 100% CPU core spin.
+- [[bugs/bbr2-pacer-oversleep]] — late timers starved quiche 0.30's BBR2 pacer of upload rate; packets now leave up to 3 ms early.
 - [[bugs/forwarding-fairness]] — 64-item stage batching and cooperative continuation to prevent UDP intake starvation.
 - [[bugs/warp-official-audit-2026-10-25]] — reverse-engineering audit of official Cloudflare WARP (`warp-svc` 2026.8.2115.0) vs `usque-rs` and `v0.2.0`/`v0.2.1` optimizations.
 

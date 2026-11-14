@@ -4,7 +4,7 @@ The repository root is the canonical Rust crate.
 
 ## Implementation files
 
-- `Cargo.toml`, `Cargo.lock`: crate metadata and locked dependency graph (`quiche` 0.22 with vendored BoringSSL).
+- `Cargo.toml`, `Cargo.lock`: crate metadata and locked dependency graph (`quiche` 0.30; BoringSSL is built by the `boring-sys` crate).
 - `Cross.toml`, `.cargo/config.toml`: cross-compilation targets and flags.
 - `clippy.toml`, `rustfmt.toml`: static analysis and formatting configuration.
 - `src/`: all Rust modules (`main.rs`, `config.rs`, `register.rs`, `tls.rs`, `tun_device.rs`, `tunnel.rs`, `packet.rs`, `icmp.rs`, `events.rs`, `pipeline_tests.rs`).

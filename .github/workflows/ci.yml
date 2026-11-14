@@ -40,7 +40,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build golang-go perl \
+            cmake ninja-build perl \
             pkg-config clang libclang-dev nasm
 
       - name: Install Rust stable
@@ -68,7 +68,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build golang-go perl \
+            cmake ninja-build perl \
             pkg-config clang libclang-dev nasm
 
       - name: Install Rust stable

@@ -92,3 +92,44 @@ Append new entries at the end.
 - `../../src/`, `../../tests/tunnel_mtu.rs`
 - `../../.github/workflows/ci.yml`, `../../.github/workflows/release.yml`
 - `../raw/sources/audit/2026-10-25-warp-official-vs-usque/HANDOFF.md`
+
+## 2026-11-14 — Major dependency upgrades; version 0.3.0
+
+- Every crate that was a major version behind is current: quiche 0.30,
+  reqwest 0.13, tun 0.8, rtnetlink 0.24, rcgen 0.14, x509-parser 0.18, p256
+  0.14, der 0.8, pkcs8 0.11, pem 4, base64 0.23. `rand`, `sec1` and
+  `netlink-packet-route` are no longer direct dependencies (keys come from the
+  system RNG through the `Generate` trait; the other two were never used
+  directly). Go is gone from the build: BoringSSL is built by `boring-sys`.
+- reqwest 0.13's own TLS choice is aws-lc-rs and the system certificate store.
+  The API client keeps ring and the built-in Mozilla roots by handing reqwest
+  its own rustls config (`api_tls_config`).
+- quiche 0.30 changed sending: `bbr` and `bbr2` are one new BBR2, `cubic` and
+  `reno` are unpaced. The session loop's timer-driven pacing starved the new
+  pacer; the first router test showed upload at 2.5 and 3.5 Mbit/s against 58
+  and 78 for v0.2.5. Fixed by sending up to 3 ms ahead of the schedule
+  ([[bugs/bbr2-pacer-oversleep]], [[systems/quic-and-pacing]]); with the fix,
+  upload 97 and 71 Mbit/s against 78 and 19, download 145 and 159 against 53
+  and 117.
+- New tests pin what must survive the libraries: the SubjectPublicKeyInfo sent
+  to the API, a private key written by an earlier release still producing a
+  client certificate quiche loads, the API client accepting the TLS config (and,
+  ignored by default, a live handshake), a real TUN device created and
+  configured over netlink (root only), and the pacing rule against a model of
+  the pacer. 115 unit tests on macOS, 118 on Linux as root, 4 integration.
+- Both test binaries ran on the router: the tunnel came up, `tun0` got its MTU
+  and both addresses over rtnetlink 0.24, and the trace showed `warp=on` on IPv4
+  and IPv6. The second ran as PID 2064 and logged with its tag, the four-digit
+  case of the v0.2.5 syslog fix that had not been seen live.
+- The aarch64 binary grows from 6.0 to 7.4 MB.
+- Built locally in the cross images: aarch64 in cross 0.2.5's image; x86_64
+  only in the current one (GCC 14), since 0.2.5's GCC 9 crashes on BoringSSL's
+  AVX2 Keccak, so `Cross.toml` pins that image by digest. The four 32-bit
+  targets are left to the release workflow's new build on `main`.
+
+## Sources
+
+- `../../Cargo.toml`, `../../Cross.toml`, `../../src/tunnel.rs`,
+  `../../src/register.rs`, `../../src/tls.rs`, `../../src/tun_device.rs`
+- [[bugs/bbr2-pacer-oversleep]], [[systems/quic-and-pacing]],
+  [[operations/build-and-release]]

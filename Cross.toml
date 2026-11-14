@@ -1,6 +1,5 @@
-# Go is downloaded from upstream rather than apt - distro packages may be too
-# old for BoringSSL's generate_build_files.go. The download is checked against
-# the sha256 that dl.google.com publishes for this version; change both together.
+# BoringSSL is built by the boring-sys crate (through quiche), which needs
+# cmake, a C++ compiler and libclang, and no longer Go.
 
 [build.env]
 passthrough = [
@@ -12,13 +11,16 @@ passthrough = [
 pre-build = [
     "apt-get update -qq",
     "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build perl pkg-config clang libclang-dev nasm curl ca-certificates xz-utils",
-    "curl -sSfL -o /tmp/go.tar.gz https://go.dev/dl/go1.22.10.linux-amd64.tar.gz",
-    "echo '736ce492a19d756a92719a6121226087ccd91b652ed5caec40ad6dbfb2252092  /tmp/go.tar.gz' | sha256sum -c -",
-    "tar -xzf /tmp/go.tar.gz -C /usr/local && rm /tmp/go.tar.gz",
-    "ln -sf /usr/local/go/bin/go /usr/local/bin/go",
 ]
 
 # mipsel: rust-std removed from stable; cross will build it from source via nightly.
 [target.mipsel-unknown-linux-musl]
 build-std = true
 
+
+# The cross 0.2.5 image's GCC 9 crashes compiling BoringSSL's AVX2 Keccak
+# (crypto/fipsmodule/keccak, x86_64 only: "internal compiler error in
+# expand_debug_locations"). This image (Ubuntu 24.04, GCC 14), pinned by
+# digest, builds it. The other targets keep cross's own image.
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl@sha256:4043a111de4bdb21628be33eb1a9e90dcfcb07ea96ed9df43bb2e9be53b32a05"

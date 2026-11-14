@@ -8,7 +8,7 @@ An OpenWrt-optimized Rust client for Cloudflare WARP using **MASQUE** (`CONNECT-
 
 ## Key Enhancements over Upstream `v0.1.0`
 
-- **QUIC Pacing & Congestion Control (`--congestion-control cubic|bbr|bbr2|reno`):** Honors `quiche` `SendInfo::at` pacing deadlines via a dedicated timer branch in the event loop to eliminate burst loss and congestion-window collapse on shared uplinks.
+- **QUIC Pacing & Congestion Control (`--congestion-control cubic|bbr|bbr2|reno`):** Follows `quiche`'s `SendInfo::at` pacing schedule, sending each packet up to 3 ms ahead of it so that a late timer never costs BBR2 any of its rate. With `quiche` 0.30, `bbr` and `bbr2` both select its BBR2; `cubic` and `reno` are not paced.
 - **Upload CoDel Queue Management (`--upload-codel <MS>`):** Applies RFC 8289 CoDel sojourn-time dropping at the head of `quiche`'s outgoing datagram FIFO to eliminate upload bufferbloat while preserving BBR2/CUBIC throughput.
 - **5 ms Timer Floor & 64-Item Fair Batching:** Prevents zero-duration `quiche` loss-recovery timers from spinning at 100% CPU, and bounds UDP intake, HTTP/3 polling, TUN reads, and QUIC output to 64 items per pass with cooperative continuation.
 - **Router Daemon Integration (`--ready-file`, `--syslog`):** Writes a PID readiness file only after `CONNECT-IP` HTTP 200 establishment, emits non-blocking syslog events to `/dev/log` (`logread -e usque-rs`), enforces a 90 s dead-peer idle timeout, and unlinks temporary PEM files immediately after load.
