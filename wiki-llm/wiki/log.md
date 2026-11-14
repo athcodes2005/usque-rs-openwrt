@@ -133,3 +133,11 @@ Append new entries at the end.
   `../../src/register.rs`, `../../src/tls.rs`, `../../src/tun_device.rs`
 - [[bugs/bbr2-pacer-oversleep]], [[systems/quic-and-pacing]],
   [[operations/build-and-release]]
+
+## 2026-11-14 — v0.3.0 released and deployed
+
+- v0.3.0 was tagged and built for all six targets (aarch64 archive
+  `2f87783e…`) and deployed to the router through router-script's updater.
+  Interleaved against v0.2.5 there: upload 147.5 and 149.2 Mbit/s against 117.6
+  and 14.5, download 131.0 and 111.0 against 118.3 and 150.0. The pacing fix
+  holds in the published build.
